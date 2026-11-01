@@ -1278,7 +1278,7 @@ jobs:
           LANGUAGE = os.environ.get("REVID_LANGUAGE", "vi-VN")
           RATE = os.environ.get("REVID_RATE", "0%")
           TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.0"))
-          WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "6")))
+          WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "2")))
           MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
           ERROR_RATIO = float(os.environ.get("TTS_ERROR_RATIO", "0.1"))
           HEADERS = {
