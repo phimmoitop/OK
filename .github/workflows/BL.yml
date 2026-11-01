@@ -217,6 +217,7 @@ jobs:
             --cookies work/cookies.txt --no-playlist
             --continue --no-overwrites
             --extractor-retries 3 --fragment-retries 5 --retries 3 --socket-timeout 30
+            --throttled-rate 350K --extractor-retries 10
             --add-header "User-Agent: $UA"
             --add-header "Referer: https://www.bilibili.com/"
             --add-header "Origin: https://www.bilibili.com"
