@@ -684,7 +684,7 @@ jobs:
                   blur_h = min(blur_h, int(height * .18) // 2 * 2)
                   blur_w = max(2, int(width * .80) // 2 * 2)
                   blur_x = (width - blur_w) // 2
-                  
+
                   # Giữ tâm blur đúng tại center_y; nếu vượt đáy/đỉnh thì cắt bớt, KHÔNG dịch
                   top = max(0, center_y - blur_h // 2)
                   bottom = min(height, center_y + blur_h // 2)
@@ -748,8 +748,10 @@ jobs:
           Phat hien lop phu CO DINH (watermark, logo, quang cao 2 ben, chu goc tren/duoi...)
           bang cach lay 5-10 frame NGAU NHIEN (chia deu theo thoi gian, moi doan 1 frame),
           tim cac diem canh (edge) xuat hien o >=80% so frame VA gan nhu khong doi mau,
-          chi xet 4 goc + 2 ben + dai tren/duoi. Ket qua: work/static_regions.json
-          (danh sach vung se bi lam mo xuyen suot video). Loi o day KHONG lam hong workflow.
+          chi xet 4 goc + 2 ben + dai tren/duoi.
+          MOI: neu co watermark nam trong goc (mac dinh top-left, top-right) -> che FULL goc do,
+          sat mep video (khong con mot manh nho / hai manh roi rac).
+          Ket qua: work/static_regions.json. Loi o day KHONG lam hong workflow.
           """
           import cv2, json, math, os, random, subprocess
           import numpy as np
@@ -763,6 +765,15 @@ jobs:
           ZONE_BOTTOM = 0.78       # dai duoi bat dau tu day
           ZONE_SIDE = 0.175        # dai 2 ben (ty le chieu rong)
           MAX_REGIONS = 8
+          # ---- Mo rong ra FULL GOC khi co watermark trong goc ----
+          CORNERS = ("tl", "tr")   # goc duoc che full. Them "bl","br" neu muon che ca goc duoi
+          CORNER_X = 0.35          # tam box nam trong 35% chieu rong tu mep -> tinh la o goc
+          CORNER_Y = 0.25          # tam box nam trong 25% chieu cao tu mep
+          CORNER_MIN_W = 0.22      # vung che toi thieu (ty le chieu rong)
+          CORNER_MIN_H = 0.12      # vung che toi thieu (ty le chieu cao)
+          CORNER_MAX_W = 0.38      # vung che toi da
+          CORNER_MAX_H = 0.28
+          CORNER_PAD = 0.03        # le them quanh watermark
           def log(msg):
               print(msg, flush=True)
           def grab_frame(t, width, height):
@@ -792,6 +803,39 @@ jobs:
                           out.append(a)
                   boxes = out
               return boxes
+          def expand_corners(boxes, W, H):
+              """Box nam trong goc -> thay bang 1 vung goc lon, sat mep video."""
+              groups = {"tl": [], "tr": [], "bl": [], "br": []}
+              rest = []
+              for b in boxes:
+                  cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+                  left, right = cx < CORNER_X * W, cx > (1 - CORNER_X) * W
+                  top, bottom = cy < CORNER_Y * H, cy > (1 - CORNER_Y) * H
+                  key = ("t" if top else "b" if bottom else "") + ("l" if left else "r" if right else "")
+                  if len(key) == 2 and key in CORNERS:
+                      groups[key].append(b)
+                  else:
+                      rest.append(b)
+              out = list(rest)
+              for key, g in groups.items():
+                  if not g:
+                      continue
+                  ux1, uy1 = min(b[0] for b in g), min(b[1] for b in g)
+                  ux2, uy2 = max(b[2] for b in g), max(b[3] for b in g)
+                  px, py = CORNER_PAD * W, CORNER_PAD * H
+                  mw, mh = CORNER_MIN_W * W, CORNER_MIN_H * H
+                  xw, xh = CORNER_MAX_W * W, CORNER_MAX_H * H
+                  if key[1] == "l":
+                      x1, x2 = 0, min(xw, max(ux2 + px, mw))
+                  else:
+                      x1, x2 = max(W - xw, min(ux1 - px, W - mw)), W
+                  if key[0] == "t":
+                      y1, y2 = 0, min(xh, max(uy2 + py, mh))
+                  else:
+                      y1, y2 = max(H - xh, min(uy1 - py, H - mh)), H
+                  log(f"[STATIC-OVERLAY] goc {key}: che full {int(x2 - x1)}x{int(y2 - y1)} (small-scale)")
+                  out.append([x1, y1, x2, y2])
+              return out
           def detect():
               if os.environ.get("STATIC_DETECT", "1") != "1":
                   log("[STATIC-OVERLAY] tat (STATIC_DETECT != 1)")
@@ -867,7 +911,10 @@ jobs:
                   if h > 0.6 * sh and w < 0.04 * W_SMALL:
                       continue
                   boxes.append([x - 4, y - 4, x + w + 4, y + h + 4])
-              boxes = merge_boxes(boxes, gap=6)
+              # gom cac manh gan nhau -> mo rong thanh FULL goc -> gop lai
+              boxes = merge_boxes(boxes, gap=int(W_SMALL * 0.04))
+              boxes = expand_corners(boxes, W_SMALL, sh)
+              boxes = merge_boxes(boxes, gap=2)
               # vung blur sub (da duoc lam mo roi) -> bo qua box nam gon trong do
               sub_rect = None
               gp = WORK / "subtitle_geometry.json"
@@ -895,7 +942,11 @@ jobs:
                       if ix * iy >= 0.6 * w * h:
                           log(f"[STATIC-OVERLAY] bo qua vung ({x1},{y1},{w},{h}): nam trong vung blur sub")
                           continue
-                  regions.append({"x": x1, "y": y1, "w": w, "h": h})
+                  # feather = [trai, phai, tren, duoi]; 0 = canh sat mep video -> KHONG feather
+                  tol = 6
+                  feather = [int(x1 > tol), int(x1 + w < width - tol),
+                             int(y1 > tol), int(y1 + h < height - tol)]
+                  regions.append({"x": x1, "y": y1, "w": w, "h": h, "feather": feather})
               regions.sort(key=lambda r: r["w"] * r["h"], reverse=True)
               regions = regions[:MAX_REGIONS]
               if sum(r["w"] * r["h"] for r in regions) > 0.30 * width * height:
@@ -907,7 +958,7 @@ jobs:
                                     (255, 0, 255), 3)
                   cv2.imwrite("work/static-regions-preview.jpg", first_img)
               for r in regions:
-                  log(f"[STATIC-OVERLAY] che: x={r['x']} y={r['y']} w={r['w']} h={r['h']}")
+                  log(f"[STATIC-OVERLAY] che: x={r['x']} y={r['y']} w={r['w']} h={r['h']} feather={r['feather']}")
               if not regions:
                   log("[STATIC-OVERLAY] khong tim thay lop phu co dinh nao")
               return regions
@@ -1696,18 +1747,22 @@ jobs:
                   f"{{\\an5\\pos({center_x},{center_y})}}{text}"
               )
           Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
-          def feather_mask(w, h, fx, fy, path):
-              """Mặt nạ alpha feather 4 cạnh: dựng MỘT LẦN bằng numpy thành ảnh PNG xám tĩnh,
-              thay cho geq (tính lại từng pixel của từng frame)."""
+          def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
+              """Mat na alpha feather. sides = (trai, phai, tren, duoi); 0 = canh do KHONG feather
+              (dung cho canh sat mep video de dai sat mep van duoc lam mo 100%)."""
               fx, fy = float(max(1, fx)), float(max(1, fy))
               xs = np.arange(w, dtype=np.float32)[None, :]
               ys = np.arange(h, dtype=np.float32)[:, None]
-              alpha = np.minimum(np.minimum(xs / fx, (w - 1 - xs) / fx),
-                                 np.minimum(ys / fy, (h - 1 - ys) / fy))
-              alpha = np.clip(alpha, 0.0, 1.0)
+              big = np.float32(1e6)
+              l = xs / fx if sides[0] else big
+              r = (w - 1 - xs) / fx if sides[1] else big
+              t = ys / fy if sides[2] else big
+              b = (h - 1 - ys) / fy if sides[3] else big
+              alpha = np.clip(np.minimum(np.minimum(l, r), np.minimum(t, b)), 0.0, 1.0)
+              alpha = np.broadcast_to(alpha, (h, w))
               cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
           feather_mask(blur_w, blur_h, feather_x, feather_y, "work/blur_mask.png")
-          # ---- Vùng che cố định (watermark / quảng cáo 2 bên / 4 góc) từ bước static_detect ----
+          # ---- Vùng che cố định (watermark / quảng cáo 2 bên / FULL góc) từ bước static_detect ----
           regions = []
           sp = Path("work/static_regions.json")
           if sp.exists():
@@ -1722,20 +1777,20 @@ jobs:
               w = min(w, width - x) // 2 * 2
               h = min(h, height - y) // 2 * 2
               if w >= 16 and h >= 12:
-                  clean.append((x, y, w, h))
+                  clean.append((x, y, w, h, r.get("feather", [1, 1, 1, 1])))
           regions = clean
           for old in Path("work").glob("static_mask_*.png"):
               old.unlink()
-          for k, (x, y, w, h) in enumerate(regions):
+          for k, (x, y, w, h, fs) in enumerate(regions):
               fx = max(4, int(round(min(w, h) * .18)))
-              feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png")
+              feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png", sides=fs)
           # Input: 0 = raw_video.mp4, 1 = work/tts_track.wav, 2 = work/blur_mask.png (lặp),
           #        3 = work/duck_env.wav, 4.. = work/static_mask_k.png (lặp)
           n_split = 2 + len(regions)
           graph = ["[0:v]split=%d[vbase][vpatchsrc]" % n_split
                    + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
           cur = "vbase"
-          for k, (x, y, w, h) in enumerate(regions):
+          for k, (x, y, w, h, fs) in enumerate(regions):
               sg = max(10, min(60, int(round(h * .60))))
               graph.append(
                   f"[sp{k}]crop={w}:{h}:{x}:{y},gblur=sigma={sg},format=rgb24[sb{k}];"
@@ -1758,8 +1813,8 @@ jobs:
           print(f"Subtitle text bbox: center_y={center_y}, height={sub_h}px")
           print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}; fixed for full video.")
           print(f"Static overlay blur regions: {len(regions)}")
-          for k, (x, y, w, h) in enumerate(regions):
-              print(f"  [{k}] x={x} y={y} w={w} h={h}")
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              print(f"  [{k}] x={x} y={y} w={w} h={h} feather(l,r,t,b)={fs}")
           print(f"Vietnamese overlay: centered at ({center_x},{center_y}), font={font_size}px.")
           PY
           DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
