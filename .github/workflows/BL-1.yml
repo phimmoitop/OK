@@ -215,6 +215,8 @@ jobs:
           SPARSE_SAMPLES = 150
           MAX_REUSE = 2        # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
           SAME_IOU = 0.85      # nguong giong nhau cua mat na chu sang
+          FAST_HALF_K = 1.25   # nửa chiều cao dải OCR fast = text_height * K (cũ 0.9 → ~100px, 1.35 → ~150px)
+          BLUR_H_K = 1.5       # chiều cao vùng blur = text_height * K (cũ 1.1)
           def log(msg):
               print(msg, flush=True)
           def make_engine():
@@ -365,8 +367,8 @@ jobs:
               if sy1 - sy0 < 16:
                   return y0, height, False, None
               # ---- tu kiem tra: nhan dang-rieng tren dong sub co khop ket qua det+rec khong? ----
-              ty0 = max(y0, int(cy - th * 0.9))
-              ty1 = min(height, int(cy + th * 0.9))
+              ty0 = max(y0, int(cy - th * FAST_HALF_K))
+              ty1 = min(height, int(cy + th * FAST_HALF_K))
               by_frame = {}
               for d in band:
                   by_frame.setdefault(d["frame"], []).append(d)
@@ -607,7 +609,7 @@ jobs:
                   heights = [v["y2"] - v["y1"] for v in frame_unions]
                   center_y = int(round(float(np.median(centers))))
                   text_height = int(round(float(np.percentile(heights, 90))))
-                  blur_h = max(24, int(math.ceil(text_height * 1.1 / 2.0) * 2))
+                  blur_h = max(24, int(math.ceil(text_height * BLUR_H_K / 2.0) * 2))
                   blur_h = min(blur_h, int(height * .18) // 2 * 2)
                   blur_w = max(2, int(width * .80) // 2 * 2)
                   blur_x = (width - blur_w) // 2
