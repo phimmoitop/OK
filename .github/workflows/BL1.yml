@@ -1,4 +1,4 @@
-name: "[1/2] Bilibili → OCR + Dịch + TTS Mix → VPS"
+name: "[1/2] Bilibili → OCR + Dịch + TTS Mix → Pixeldrain"
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ jobs:
       PYTHONUNBUFFERED: "1"
       LC_ALL: "C.UTF-8"
       LANG: "C.UTF-8"
-      VPS_URL: "https://cp.ssplay.net/upload.php"
       SLUG: ${{ inputs.slug }}
 
     steps:
@@ -47,7 +46,7 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg zip unzip jq
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -76,75 +75,63 @@ jobs:
           print("ALL IMPORTS OK")
           PY
       # ============================================================
-      # SMOKE TEST: VPS (upload.php) + REVID TTS. Lỗi thì dừng ngay.
+      # SMOKE TEST: PIXELDRAIN API KEY + VIETTEL TTS. Lỗi thì dừng ngay.
       # ============================================================
-      - name: Test VPS upload.php (smoke test, stop early if it fails)
+      - name: Test Pixeldrain API key (smoke test, stop early if it fails)
         env:
-          VPS_KEY: ${{ secrets.UPLOAD_KEY }}
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$VPS_KEY" ] || { echo '::error::Missing GitHub secret UPLOAD_KEY'; exit 1; }
-          code=$(curl -s -o /tmp/vps_status.json -w "%{http_code}" --retry 3 --retry-all-errors \
-            -H "X-Upload-Key: $VPS_KEY" -G "$VPS_URL" \
-            --data-urlencode "action=status" \
-            --data-urlencode "job=$SLUG" \
-            --data-urlencode "name=${SLUG}.mp4")
-          echo "HTTP $code: $(head -c 300 /tmp/vps_status.json)"
-          [ "$code" = "200" ] || { echo '::error::VPS upload.php không truy cập được / sai key'; exit 1; }
-      - name: Test Revid TTS API (smoke test, stop early if it fails)
+          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY (Pixeldrain bắt buộc API key để upload, không còn upload ẩn danh)'; exit 1; }
+          code=$(curl -s -o /tmp/pd_user.json -w "%{http_code}" --retry 3 --retry-all-errors \
+            -u ":$PD_KEY" "https://pixeldrain.com/api/user" || true)
+          echo "HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::Pixeldrain API key sai / không truy cập được: $(head -c 300 /tmp/pd_user.json 2>/dev/null)"; exit 1; }
+          can_upload=$(jq -r '.can_upload // true' /tmp/pd_user.json)
+          echo "Pixeldrain user: $(jq -r '.username' /tmp/pd_user.json) | can_upload=$can_upload"
+          [ "$can_upload" != "false" ] || { echo '::error::Tài khoản Pixeldrain chưa được phép upload (cần xác minh email)'; exit 1; }
+      - name: Test Viettel TTS API (smoke test, stop early if it fails)
         env:
-          REVID_API_KEY: ${{ secrets.REVID_API_KEY }}
-          REVID_VOICE_ID: "3001"
-          REVID_LANGUAGE: "vi-VN"
-          REVID_RATE: "0%"
+          VIETTEL_VOICE: "hn-thanhphuong"
+          VIETTEL_SPEED: "1"
         run: |
           set -euo pipefail
           mkdir -p work
           python3 <<'PY'
-          import os, sys, base64, subprocess
-          from urllib.parse import urlparse
+          import os, sys, time, subprocess
           import numpy as np
           import requests
-          API_URL = "https://tts.revidapi.com/api/v1/tts"
-          key = os.environ.get("REVID_API_KEY", "").strip()
-          if not key:
-              raise SystemExit("Missing GitHub secret REVID_API_KEY")
-          payload = {
-              "text": "Xin chào, đây là bài kiểm tra giọng nói của tôi.",
-              "voice_id": int(os.environ["REVID_VOICE_ID"]),
-              "language": os.environ["REVID_LANGUAGE"],
-              "rate": os.environ["REVID_RATE"],
-              "return_base64": True,
-          }
-          headers = {
+          API_URL = "https://viettelai.vn/tts/speech_synthesis"
+          HEADERS = {
               "Content-Type": "application/json",
-              "Accept": "application/json",
-              "x-api-key": key,
-              "x-revidapi-client": "tts-studio",
+              "Origin": "https://viettelai.vn",
+              "Referer": "https://viettelai.vn/chuyen-giong-noi",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
           }
-          r = requests.post(API_URL, json=payload, headers=headers, timeout=100)
-          print(f"HTTP {r.status_code}")
-          try:
-              data = r.json()
-          except ValueError:
-              raise SystemExit(f"Revid API trả về không phải JSON: {r.text[:300]}")
-          if r.status_code != 200 or not data.get("success"):
-              raise SystemExit(f"Revid API lỗi: {data.get('error')} | {str(data)[:300]}")
+          payload = {
+              "speed": float(os.environ["VIETTEL_SPEED"]),
+              "text": "Xin chào, đây là bài kiểm tra giọng nói của tôi.",
+              "tts_return_option": 3,
+              "voice": os.environ["VIETTEL_VOICE"],
+              "without_filter": False,
+          }
           audio = None
-          b64 = data.get("audio_base64")
-          if b64:
-              if b64.startswith("data:"):
-                  b64 = b64.split(",", 1)[1]
-              audio = base64.b64decode(b64)
-          if not audio and data.get("audio_url"):
-              u = urlparse(data["audio_url"])
-              if u.scheme != "https" or (u.hostname or "").lower() != "tts.revidapi.com":
-                  raise SystemExit("audio_url không hợp lệ")
-              rr = requests.get(data["audio_url"], timeout=90, allow_redirects=False)
-              rr.raise_for_status()
-              audio = rr.content
+          last = "unknown"
+          for attempt in range(1, 4):
+              try:
+                  r = requests.post(API_URL, json=payload, headers=HEADERS, timeout=100)
+                  print(f"HTTP {r.status_code} | content-type={r.headers.get('Content-Type')} | bytes={len(r.content)}")
+                  ctype = r.headers.get("Content-Type", "").lower()
+                  if r.status_code == 200 and len(r.content) > 500 and "json" not in ctype and "text" not in ctype:
+                      audio = r.content
+                      break
+                  last = f"HTTP {r.status_code}: {r.text[:200]!r}"
+              except requests.RequestException as e:
+                  last = repr(e)
+              time.sleep(3 * attempt)
           if not audio:
-              raise SystemExit("API không trả về dữ liệu MP3")
+              raise SystemExit(f"Viettel TTS lỗi (IP runner có thể bị chặn?): {last}")
           open("work/test_1.mp3", "wb").write(audio)
           p = subprocess.run(
               ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "work/test_1.mp3",
@@ -155,7 +142,7 @@ jobs:
           peak = float(np.abs(a).max()) if a.size else 0.0
           print(f"Test OK: dur={dur:.2f}s peak={peak:.3f} bytes={len(audio)}")
           if a.size == 0 or not np.isfinite(a).all() or peak < 0.01 or dur < 0.5:
-              raise SystemExit("Revid test audio is empty/invalid -> stop workflow")
+              raise SystemExit("Viettel test audio is empty/invalid -> stop workflow")
           PY
       # ============================================================
       # TỪ ĐÂY TRỞ XUỐNG: TẢI VIDEO + OCR + DỊCH + TTS
@@ -164,121 +151,6 @@ jobs:
         run: |
           set -eux
           mkdir -p work output chunks
-      - name: Create VPS upload script
-        run: |
-          cat > vps_upload.py <<'PY'
-          """
-          Upload file len VPS (upload.php) theo tung chunk, co retry + resume + kiem tra sha256.
-          Dung: python3 vps_upload.py "local_path:ten_tren_vps" [...]
-          Env : VPS_URL, VPS_KEY, SLUG, (tuy chon) CHUNK_MB
-          """
-          import hashlib, os, sys, time
-          import requests
-          URL = os.environ["VPS_URL"]
-          KEY = os.environ["VPS_KEY"]
-          SLUG = os.environ["SLUG"]
-          CHUNK = int(os.environ.get("CHUNK_MB", "16")) * 1024 * 1024
-          RETRIES = 8
-          FILE_ATTEMPTS = 3
-          HEAD = {"X-Upload-Key": KEY}
-          SESSION = requests.Session()
-          def log(msg):
-              print(msg, flush=True)
-          def jr(r):
-              try:
-                  return r.json()
-              except ValueError:
-                  return {}
-          def call(method, params=None, data=None, files=None, timeout=300):
-              last = "unknown"
-              for attempt in range(RETRIES):
-                  try:
-                      r = SESSION.request(method, URL, params=params, data=data, files=files,
-                                          headers=HEAD, timeout=timeout)
-                      if r.status_code in (429, 500, 502, 503, 504):
-                          last = f"HTTP {r.status_code}: {r.text[:200]}"
-                      else:
-                          if r.status_code in (401, 403):
-                              raise PermissionError(f"VPS tu choi (HTTP {r.status_code}) - kiem tra UPLOAD_KEY")
-                          return r
-                  except requests.RequestException as e:
-                      last = repr(e)
-                  log(f"   retry {attempt + 1}/{RETRIES}: {last}")
-                  time.sleep(min(60, 4 * (attempt + 1)))
-              raise RuntimeError(f"het {RETRIES} lan thu: {last}")
-          def sha256_file(path):
-              h = hashlib.sha256()
-              with open(path, "rb") as f:
-                  while True:
-                      b = f.read(8 * 1024 * 1024)
-                      if not b:
-                          break
-                      h.update(b)
-              return h.hexdigest()
-          def upload_once(local, remote, size, sha):
-              r = call("GET", params={"action": "status", "job": SLUG, "name": remote})
-              st = jr(r)
-              if st.get("exists") and st.get("size") == size and st.get("sha256") == sha:
-                  log(f"[SKIP] {remote}: da co tren VPS ({size / 1e6:.1f} MB)")
-                  return
-              log(f"[UP] {remote}: {size / 1e6:.1f} MB, chunk {CHUNK // (1024 * 1024)} MB")
-              t0 = time.time()
-              offset, n = 0, 0
-              with open(local, "rb") as f:
-                  while offset < size:
-                      f.seek(offset)
-                      buf = f.read(CHUNK)
-                      r = call("POST",
-                               data={"action": "upload", "job": SLUG, "name": remote, "offset": str(offset)},
-                               files={"chunk": ("chunk.bin", buf)})
-                      j = jr(r)
-                      if r.status_code != 200 or not j.get("ok"):
-                          raise RuntimeError(f"upload {remote} offset={offset}: HTTP {r.status_code} {r.text[:200]}")
-                      offset += len(buf)
-                      n += 1
-                      if n % 10 == 0 or offset >= size:
-                          el = time.time() - t0
-                          log(f"   {remote}: {offset / 1e6:.0f}/{size / 1e6:.0f} MB | {offset / 1e6 / max(el, 1e-6):.1f} MB/s")
-              r = call("POST", data={"action": "finish", "job": SLUG, "name": remote,
-                                     "size": str(size), "sha256": sha})
-              j = jr(r)
-              if r.status_code != 200 or not j.get("ok"):
-                  raise RuntimeError(f"finish {remote}: HTTP {r.status_code} {r.text[:200]}")
-              log(f"[OK] {remote} xong sau {time.time() - t0:.0f}s")
-          def upload(local, remote):
-              if not os.path.isfile(local):
-                  raise RuntimeError(f"Khong thay file {local}")
-              size = os.path.getsize(local)
-              if size == 0:
-                  raise RuntimeError(f"File rong: {local}")
-              sha = sha256_file(local)
-              last = None
-              for k in range(FILE_ATTEMPTS):
-                  try:
-                      upload_once(local, remote, size, sha)
-                      return
-                  except PermissionError:
-                      raise
-                  except Exception as e:
-                      last = e
-                      log(f"[WARN] {remote} lan {k + 1}/{FILE_ATTEMPTS} loi: {e}")
-                      time.sleep(10)
-              raise RuntimeError(f"Upload {remote} that bai: {last}")
-          def main():
-              pairs = sys.argv[1:]
-              if not pairs:
-                  raise SystemExit("Thieu danh sach file")
-              for p in pairs:
-                  local, remote = p.rsplit(":", 1)
-                  upload(local, remote)
-              log("UPLOAD COMPLETE")
-          if __name__ == "__main__":
-              try:
-                  main()
-              except Exception as e:
-                  print(f"UPLOAD FAILED: {e}", flush=True)
-                  sys.exit(1)
-          PY
       - name: Prepare Bilibili cookies (inline Python)
         env:
           BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
@@ -839,28 +711,16 @@ jobs:
           if __name__ == "__main__":
               main()
           PY
-      - name: OCR subtitles and detect per-video subtitle geometry (+ upload raw video in parallel)
+      - name: OCR subtitles and detect per-video subtitle geometry
         id: ocr
         env:
           OMP_NUM_THREADS: "1"
           OCR_FAST: "1"   # 1 = tự thử chế độ nhanh (chỉ nhận dạng); 0 = luôn dùng det+rec như cũ
-          VPS_KEY: ${{ secrets.UPLOAD_KEY }}
         run: |
           set -euo pipefail
           mkdir -p work/ocr
-          # Upload video gốc lên VPS NGAY, chạy song song lúc OCR (lỗi ở đây không làm hỏng job:
-          # bước upload cuối sẽ tự upload lại / bỏ qua nếu file đã có đủ)
-          python3 vps_upload.py "raw_video.mp4:${SLUG}.mp4" > work/upload_bg.log 2>&1 &
-          UP_PID=$!
           python3 ocr_run.py
           cp work/ocr/hardsub-3fps.srt work/native.srt
-          echo "--- đợi upload video gốc (chạy nền) ---"
-          if wait "$UP_PID"; then
-            echo "Upload nền: OK"
-          else
-            echo "::warning::Upload nền video gốc lỗi, sẽ thử lại ở bước upload cuối."
-          fi
-          tail -n 8 work/upload_bg.log || true
       - name: Check subtitle geometry (stop early if OCR failed)
         run: |
           python3 <<'PY'
@@ -1434,39 +1294,35 @@ jobs:
           echo "===== VIETNAMESE VTT (head) ====="
           head -40 work/vietnamese.vtt || true
           wc -l work/vietnamese.vtt || true
-      - name: TTS Generation (Revid TTS API + Vietnamese VTT)
+      - name: TTS Generation (Viettel TTS API + Vietnamese VTT)
         env:
-          REVID_API_KEY: ${{ secrets.REVID_API_KEY }}
-          REVID_VOICE_ID: "3001"       # voice_id của Revid
-          REVID_LANGUAGE: "vi-VN"
-          REVID_RATE: "0%"             # tốc độ do API xử lý (0% = gốc). Việc tăng tốc để khớp thời gian làm ở bước mix
-          TTS_SPEEDUP: "1.0"           # tăng tốc thêm bằng ffmpeg atempo sau khi nhận mp3 (1.0 = giữ nguyên)
-          TTS_WORKERS: "4"             # số request song song tới API (giảm xuống 1-2 nếu bị 429)
-          TTS_MAX_RETRIES: "3"         # thử lại khi API trả 429/5xx hoặc lỗi mạng
-          TTS_ERROR_RATIO: "0.1"     # quá số đoạn lỗi này thì dừng workflow
+          VIETTEL_VOICE: "hn-thanhphuong"   # giọng Viettel (vd: hn-thanhphuong, hn-thanhtung, hcm-diemmy ...)
+          VIETTEL_SPEED: "1"                # tốc độ do API xử lý (1 = gốc). Việc tăng tốc để khớp thời gian làm ở bước mix
+          TTS_SPEEDUP: "1.0"                # tăng tốc thêm bằng ffmpeg atempo sau khi nhận mp3 (1.0 = giữ nguyên)
+          TTS_WORKERS: "2"                  # số request song song (API web không key -> nên để thấp, bị 429 thì giảm xuống 1)
+          TTS_MAX_RETRIES: "4"              # thử lại khi API trả 429/5xx hoặc lỗi mạng
+          TTS_ERROR_RATIO: "0.1"            # quá tỉ lệ đoạn lỗi này thì dừng workflow
         run: |
           python3 <<'PY'
-          import os, re, sys, time, base64, subprocess, logging
+          import os, re, sys, time, subprocess, logging
           from concurrent.futures import ThreadPoolExecutor, as_completed
-          from urllib.parse import urlparse
           import numpy as np
           import requests
           import webvtt
           logging.basicConfig(level=logging.INFO, format="%(message)s")
-          API_URL = "https://tts.revidapi.com/api/v1/tts"
-          API_KEY = os.environ.get("REVID_API_KEY", "").strip()
-          VOICE_ID = int(os.environ.get("REVID_VOICE_ID", "3001"))
-          LANGUAGE = os.environ.get("REVID_LANGUAGE", "vi-VN")
-          RATE = os.environ.get("REVID_RATE", "0%")
+          API_URL = "https://viettelai.vn/tts/speech_synthesis"
+          VOICE = os.environ.get("VIETTEL_VOICE", "hn-thanhphuong")
+          SPEED = float(os.environ.get("VIETTEL_SPEED", "1"))
           TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.0"))
           WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "2")))
-          MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
+          MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "4")))
           ERROR_RATIO = float(os.environ.get("TTS_ERROR_RATIO", "0.1"))
           HEADERS = {
               "Content-Type": "application/json",
-              "Accept": "application/json",
-              "x-api-key": API_KEY,
-              "x-revidapi-client": "tts-studio",
+              "Origin": "https://viettelai.vn",
+              "Referer": "https://viettelai.vn/chuyen-giong-noi",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
           }
           import unicodedata
           def normalize_for_tts(text):
@@ -1511,13 +1367,13 @@ jobs:
               w = max(1, n_words(text))
               return max(0.15, 0.08 * w) <= dur <= 0.9 * w + 2.5
           def fetch_mp3(text):
-              """Goi Revid TTS API, tra ve bytes mp3. Retry khi 429/5xx/loi mang."""
+              """Goi Viettel TTS (khong can API key), tra ve bytes mp3. Retry khi 429/5xx/loi mang."""
               payload = {
+                  "speed": SPEED,
                   "text": text,
-                  "voice_id": VOICE_ID,
-                  "language": LANGUAGE,
-                  "rate": RATE,
-                  "return_base64": True,
+                  "tts_return_option": 3,   # 3 = tra ve mp3
+                  "voice": VOICE,
+                  "without_filter": False,
               }
               last = "unknown"
               for attempt in range(MAX_RETRIES):
@@ -1527,26 +1383,16 @@ jobs:
                           last = f"HTTP {r.status_code}"
                           time.sleep(3 * (attempt + 1))
                           continue
-                      data = r.json()
-                      if r.status_code != 200 or not data.get("success"):
-                          raise RuntimeError(f"API loi HTTP {r.status_code}: {data.get('error')}")
-                      audio = None
-                      b64 = data.get("audio_base64")
-                      if b64:
-                          if b64.startswith("data:"):
-                              b64 = b64.split(",", 1)[1]
-                          audio = base64.b64decode(b64)
-                      if not audio and data.get("audio_url"):
-                          u = urlparse(data["audio_url"])
-                          if u.scheme != "https" or (u.hostname or "").lower() != "tts.revidapi.com":
-                              raise RuntimeError("audio_url khong hop le")
-                          rr = requests.get(data["audio_url"], timeout=90, allow_redirects=False)
-                          rr.raise_for_status()
-                          audio = rr.content
-                      if not audio:
-                          raise RuntimeError("API khong tra ve du lieu MP3")
-                      return audio
-                  except (requests.RequestException, ValueError) as e:
+                      if r.status_code != 200:
+                          raise RuntimeError(f"API loi HTTP {r.status_code}: {r.text[:200]!r}")
+                      ctype = r.headers.get("Content-Type", "").lower()
+                      if "json" in ctype or "text" in ctype or len(r.content) < 500:
+                          # API tra ve loi dang JSON/text thay vi audio -> thu lai
+                          last = f"khong phai audio (ctype={ctype}, {len(r.content)} bytes): {r.text[:150]!r}"
+                          time.sleep(3 * (attempt + 1))
+                          continue
+                      return r.content
+                  except requests.RequestException as e:
                       last = repr(e)
                       time.sleep(3 * (attempt + 1))
               raise RuntimeError(f"het {MAX_RETRIES} lan thu: {last}")
@@ -1576,15 +1422,13 @@ jobs:
                       os.remove(out)
                   return i, text, False, str(e)
           def main():
-              if not API_KEY:
-                  print("Missing GitHub secret REVID_API_KEY"); sys.exit(1)
               vtt_path = "work/vietnamese.vtt"
               if not os.path.exists(vtt_path):
                   print(f"Missing {vtt_path}"); sys.exit(1)
               vtt = webvtt.read(vtt_path)
               os.makedirs("chunks", exist_ok=True)
               total = len(vtt)
-              print(f"[Revid] voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
+              print(f"[Viettel] voice={VOICE} speed={SPEED} | "
                     f"speedup={TTS_SPEEDUP} | workers={WORKERS} | cues={total}", flush=True)
               jobs = []
               for i, c in enumerate(vtt):
@@ -1594,7 +1438,7 @@ jobs:
                       continue
                   jobs.append((i, text))
               ERROR_THRESHOLD = max(1, int(len(jobs) * ERROR_RATIO))
-              print(f"[Revid] Dừng nếu lỗi >= {ERROR_THRESHOLD}/{len(jobs)} đoạn", flush=True)
+              print(f"[Viettel] Dừng nếu lỗi >= {ERROR_THRESHOLD}/{len(jobs)} đoạn", flush=True)
               failed = []   # (index, text)
               made = 0
               done = 0
@@ -1608,7 +1452,7 @@ jobs:
                           made += 1
                       else:
                           failed.append((i, text))
-                          print(f"[Revid] doan {i} loi -> bo qua: {msg}", flush=True)
+                          print(f"[Viettel] doan {i} loi -> bo qua: {msg}", flush=True)
                       if done % 20 == 0 or done == len(jobs):
                           el = time.time() - t0
                           print(f"TTS {done}/{len(jobs)} | ok={made} | loi={len(failed)} | {el:.0f}s", flush=True)
@@ -1621,7 +1465,7 @@ jobs:
                   print(f"Phát hiện {failed_count} đoạn lỗi (vượt ngưỡng {ERROR_THRESHOLD}). Dừng Workflow!")
                   sys.exit(1)
               with open("count.txt", "w") as f: f.write(str(total))
-              print(f"[DONE] Generated {total} TTS chunks (Revid ok={made}, loi={failed_count})")
+              print(f"[DONE] Generated {total} TTS chunks (Viettel ok={made}, loi={failed_count})")
           main()
           PY
       - name: Build TTS track (numpy, one pass) & final mix filter
@@ -1851,33 +1695,80 @@ jobs:
               print(f"::warning::Audio mix lệch {abs(v - a):.1f}s so với video, kiểm tra lại.")
           PY
       # ============================================================
-      # UPLOAD TẤT CẢ LÊN VPS (file nào đã có đủ + đúng sha256 thì bỏ qua)
+      # ĐÓNG GÓI 1 FILE ZIP + UPLOAD LÊN PIXELDRAIN -> lấy ID
+      # Zip chứa: raw_video.mp4, mixed_audio.m4a, vietnamese.srt/.vtt,
+      #           subtitle_geometry.json, static_regions.json
+      # (dùng zip -0: chỉ đóng gói, không nén lại vì mp4/m4a đã nén sẵn)
       # ============================================================
-      - name: Upload backup to VPS (video + audio mix + sub + geometry)
+      - name: Pack results and upload to Pixeldrain
+        id: pixel
         env:
-          VPS_KEY: ${{ secrets.UPLOAD_KEY }}
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
-          # Tên file trên VPS: <slug>.mp4 / .m4a / .srt / .vtt / .geometry.json / .regions.json
-          python3 vps_upload.py \
-            "work/vietnamese.srt:${SLUG}.srt" \
-            "work/vietnamese.vtt:${SLUG}.vtt" \
-            "work/subtitle_geometry.json:${SLUG}.geometry.json" \
-            "work/static_regions.json:${SLUG}.regions.json" \
-            "work/mixed_audio.m4a:${SLUG}.m4a" \
-            "raw_video.mp4:${SLUG}.mp4"
+          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
+
+          rm -rf pack && mkdir -p pack
+          cp raw_video.mp4                 pack/raw_video.mp4
+          cp work/mixed_audio.m4a          pack/mixed_audio.m4a
+          cp work/vietnamese.srt           pack/vietnamese.srt
+          cp work/vietnamese.vtt           pack/vietnamese.vtt
+          cp work/subtitle_geometry.json   pack/subtitle_geometry.json
+          cp work/static_regions.json      pack/static_regions.json
+
+          ZIP="${SLUG}.zip"
+          rm -f "$ZIP"
+          (cd pack && zip -0 -q -r "../$ZIP" .)
+          unzip -tq "$ZIP"
+          SIZE=$(stat -c %s "$ZIP")
+          echo "ZIP: $ZIP = $((SIZE / 1048576)) MB"
+
+          ID=""
+          MAX=6
+          for attempt in $(seq 1 "$MAX"); do
+            echo "[UP] Pixeldrain attempt $attempt/$MAX"
+            rm -f work/pd_upload.json
+            code=$(curl -sS -T "$ZIP" -u ":$PD_KEY" \
+              -o work/pd_upload.json -w "%{http_code}" \
+              "https://pixeldrain.com/api/file/${ZIP}" || true)
+            echo "HTTP $code: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
+            if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+              ID=$(jq -r '.id // empty' work/pd_upload.json)
+              [ -n "$ID" ] && break
+            fi
+            case "$code" in
+              401|403|413|422)
+                echo "::error::Pixeldrain từ chối (HTTP $code), không thử lại: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
+                exit 1 ;;
+            esac
+            [ "$attempt" -lt "$MAX" ] && sleep $(( attempt * 10 ))
+          done
+          [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử'; exit 1; }
+
+          # Kiểm tra lại: size trên Pixeldrain phải khớp file local
+          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://pixeldrain.com/api/file/${ID}/info")
+          remote_size=$(jq -r '.size' <<<"$info")
+          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)"
+          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local'; exit 1; }
+
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Link: https://pixeldrain.com/u/${ID}"
       - name: Notify VPS (type=mix) -> VPS sẽ gọi workflow phần 2
         env:
           VIDEO_URL: ${{ inputs.link }}
+          PIXEL_ID: ${{ steps.pixel.outputs.id }}
         run: |
           set -euo pipefail
+          [ -n "$PIXEL_ID" ] || { echo '::error::Không có Pixeldrain ID'; exit 1; }
           curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
             -G "https://cp.ssplay.net/vicdn.php" \
-            --data-urlencode "type=mix" \
+            --data-urlencode "type=Pixel" \
             --data-urlencode "slug=${SLUG}" \
-            --data-urlencode "link=${VIDEO_URL}"
+            --data-urlencode "link=${VIDEO_URL}" \
+            --data-urlencode "pixel=${PIXEL_ID}"
           echo
-          echo "Đã báo type=mix cho VPS (slug=${SLUG})."
+          echo "Đã báo type=mix cho VPS (slug=${SLUG}, pixel=${PIXEL_ID})."
       - name: Cleanup cookies
         if: always()
         run: |
