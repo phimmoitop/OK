@@ -80,10 +80,10 @@ jobs:
       # ============================================================
       - name: Test VPS upload.php (smoke test, stop early if it fails)
         env:
-          VPS_KEY: ${{ secrets.VPS_UPLOAD_KEY }}
+          VPS_KEY: ${{ secrets.UPLOAD_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$VPS_KEY" ] || { echo '::error::Missing GitHub secret VPS_UPLOAD_KEY'; exit 1; }
+          [ -n "$VPS_KEY" ] || { echo '::error::Missing GitHub secret UPLOAD_KEY'; exit 1; }
           code=$(curl -s -o /tmp/vps_status.json -w "%{http_code}" --retry 3 --retry-all-errors \
             -H "X-Upload-Key: $VPS_KEY" -G "$VPS_URL" \
             --data-urlencode "action=status" \
@@ -199,7 +199,7 @@ jobs:
                           last = f"HTTP {r.status_code}: {r.text[:200]}"
                       else:
                           if r.status_code in (401, 403):
-                              raise PermissionError(f"VPS tu choi (HTTP {r.status_code}) - kiem tra VPS_UPLOAD_KEY")
+                              raise PermissionError(f"VPS tu choi (HTTP {r.status_code}) - kiem tra UPLOAD_KEY")
                           return r
                   except requests.RequestException as e:
                       last = repr(e)
@@ -844,7 +844,7 @@ jobs:
         env:
           OMP_NUM_THREADS: "1"
           OCR_FAST: "1"   # 1 = tự thử chế độ nhanh (chỉ nhận dạng); 0 = luôn dùng det+rec như cũ
-          VPS_KEY: ${{ secrets.VPS_UPLOAD_KEY }}
+          VPS_KEY: ${{ secrets.UPLOAD_KEY }}
         run: |
           set -euo pipefail
           mkdir -p work/ocr
@@ -1855,7 +1855,7 @@ jobs:
       # ============================================================
       - name: Upload backup to VPS (video + audio mix + sub + geometry)
         env:
-          VPS_KEY: ${{ secrets.VPS_UPLOAD_KEY }}
+          VPS_KEY: ${{ secrets.UPLOAD_KEY }}
         run: |
           set -euo pipefail
           # Tên file trên VPS: <slug>.mp4 / .m4a / .srt / .vtt / .geometry.json / .regions.json
