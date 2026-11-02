@@ -1313,7 +1313,7 @@ jobs:
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"             # tốc độ do API xử lý (0% = gốc). Việc tăng tốc để khớp thời gian làm ở bước mix
           TTS_SPEEDUP: "1.0"           # tăng tốc thêm bằng ffmpeg atempo sau khi nhận mp3 (1.0 = giữ nguyên)
-          TTS_WORKERS: "4"             # số request song song tới API (giảm xuống 1-2 nếu bị 429)
+          TTS_WORKERS: "1"             # số request song song tới API (giảm xuống 1-2 nếu bị 429)
           TTS_MAX_RETRIES: "3"         # thử lại khi API trả 429/5xx hoặc lỗi mạng
           TTS_ERROR_RATIO: "0.1"     # quá số đoạn lỗi này thì dừng workflow
         run: |
