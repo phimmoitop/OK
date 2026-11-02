@@ -1248,7 +1248,7 @@ jobs:
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"
           TTS_SPEEDUP: "1.0"
-          TTS_WORKERS: "4"             # thử lại 4 để so sánh tốc độ với workers=1
+          TTS_WORKERS: "10"             # thử lại 4 để so sánh tốc độ với workers=1
           TTS_MAX_RETRIES: "3"
           TTS_TIMEOUT: "100"           # timeout mỗi request (giây)
           TTS_HEARTBEAT: "20"          # cứ N giây in danh sách request đang chờ
