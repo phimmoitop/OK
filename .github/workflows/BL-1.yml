@@ -1308,7 +1308,7 @@ jobs:
           wc -l work/vietnamese.vtt || true
       - name: TTS Generation (Revid TTS API + Vietnamese VTT)
         env:
-          REVID_API_KEY: ${{ secrets.REVID_API_KEY }}
+          REVID_API_KEYS: ${{ secrets.REVID_API_KEYS }}   # mỗi dòng 1 key
           REVID_VOICE_ID: "3001"       # voice_id của Revid
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"             # tốc độ do API xử lý (0% = gốc). Việc tăng tốc để khớp thời gian làm ở bước mix
@@ -1318,7 +1318,7 @@ jobs:
           TTS_ERROR_RATIO: "0.1"     # quá số đoạn lỗi này thì dừng workflow
         run: |
           python3 <<'PY'
-          import os, re, sys, time, base64, subprocess, logging
+          import os, re, sys, time, base64, subprocess, logging, random
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from urllib.parse import urlparse
           import numpy as np
@@ -1326,7 +1326,12 @@ jobs:
           import webvtt
           logging.basicConfig(level=logging.INFO, format="%(message)s")
           API_URL = "https://tts.revidapi.com/api/v1/tts"
-          API_KEY = os.environ.get("REVID_API_KEY", "").strip()
+          # ---- Đọc tất cả API key từ REVID_API_KEYS (mỗi dòng 1 key), loại trùng ----
+          API_KEYS = []
+          for k in os.environ.get("REVID_API_KEYS", "").splitlines():
+              k = k.strip()
+              if k and k not in API_KEYS:
+                  API_KEYS.append(k)
           VOICE_ID = int(os.environ.get("REVID_VOICE_ID", "3001"))
           LANGUAGE = os.environ.get("REVID_LANGUAGE", "vi-VN")
           RATE = os.environ.get("REVID_RATE", "0%")
@@ -1334,12 +1339,20 @@ jobs:
           WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "2")))
           MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
           ERROR_RATIO = float(os.environ.get("TTS_ERROR_RATIO", "0.1"))
-          HEADERS = {
-              "Content-Type": "application/json",
-              "Accept": "application/json",
-              "x-api-key": API_KEY,
-              "x-revidapi-client": "tts-studio",
-          }
+          def pick_key(avoid=None):
+              """Chọn ngẫu nhiên 1 key. Nếu có nhiều key, tránh key vừa lỗi (avoid = index)."""
+              idxs = list(range(len(API_KEYS)))
+              if avoid is not None and len(idxs) > 1:
+                  idxs = [i for i in idxs if i != avoid]
+              i = random.choice(idxs)
+              return i, API_KEYS[i]
+          def make_headers(key):
+              return {
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "x-api-key": key,
+                  "x-revidapi-client": "tts-studio",
+              }
           import unicodedata
           def normalize_for_tts(text):
               text = unicodedata.normalize("NFKC", text)   # full-width -> ASCII, … -> ...
@@ -1383,7 +1396,7 @@ jobs:
               w = max(1, n_words(text))
               return max(0.15, 0.08 * w) <= dur <= 0.9 * w + 2.5
           def fetch_mp3(text):
-              """Goi Revid TTS API, tra ve bytes mp3. Retry khi 429/5xx/loi mang."""
+              """Goi Revid TTS API (moi lan goi random 1 key), tra ve bytes mp3. Retry khi 429/5xx/loi mang."""
               payload = {
                   "text": text,
                   "voice_id": VOICE_ID,
@@ -1392,16 +1405,19 @@ jobs:
                   "return_base64": True,
               }
               last = "unknown"
+              bad_key = None   # key vua loi -> lan retry uu tien key khac
               for attempt in range(MAX_RETRIES):
+                  ki, key = pick_key(avoid=bad_key)
                   try:
-                      r = requests.post(API_URL, json=payload, headers=HEADERS, timeout=100)
+                      r = requests.post(API_URL, json=payload, headers=make_headers(key), timeout=100)
                       if r.status_code in (429, 500, 502, 503, 504):
-                          last = f"HTTP {r.status_code}"
+                          last = f"HTTP {r.status_code} (key #{ki + 1})"
+                          bad_key = ki
                           time.sleep(3 * (attempt + 1))
                           continue
                       data = r.json()
                       if r.status_code != 200 or not data.get("success"):
-                          raise RuntimeError(f"API loi HTTP {r.status_code}: {data.get('error')}")
+                          raise RuntimeError(f"API loi HTTP {r.status_code} (key #{ki + 1}): {data.get('error')}")
                       audio = None
                       b64 = data.get("audio_base64")
                       if b64:
@@ -1419,7 +1435,8 @@ jobs:
                           raise RuntimeError("API khong tra ve du lieu MP3")
                       return audio
                   except (requests.RequestException, ValueError) as e:
-                      last = repr(e)
+                      last = f"{e!r} (key #{ki + 1})"
+                      bad_key = ki
                       time.sleep(3 * (attempt + 1))
               raise RuntimeError(f"het {MAX_RETRIES} lan thu: {last}")
           def save_mp3(mp3_bytes, out):
@@ -1448,15 +1465,15 @@ jobs:
                       os.remove(out)
                   return i, text, False, str(e)
           def main():
-              if not API_KEY:
-                  print("Missing GitHub secret REVID_API_KEY"); sys.exit(1)
+              if not API_KEYS:
+                  print("Missing GitHub secret REVID_API_KEYS"); sys.exit(1)
               vtt_path = "work/vietnamese.vtt"
               if not os.path.exists(vtt_path):
                   print(f"Missing {vtt_path}"); sys.exit(1)
               vtt = webvtt.read(vtt_path)
               os.makedirs("chunks", exist_ok=True)
               total = len(vtt)
-              print(f"[Revid] voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
+              print(f"[Revid] keys={len(API_KEYS)} | voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
                     f"speedup={TTS_SPEEDUP} | workers={WORKERS} | cues={total}", flush=True)
               jobs = []
               for i, c in enumerate(vtt):
