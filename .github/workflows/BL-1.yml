@@ -1298,7 +1298,6 @@ jobs:
                   if items:
                       desc = " | ".join(f"c{i}: key#{ki + 1} lan{att} cho {now - t:.0f}s"
                                         for i, (ki, att, t) in items)
-                      log(f"[HEARTBEAT] dang cho {len(items)} request: {desc}")
                   else:
                       log("[HEARTBEAT] khong co request nao dang cho")
           def pick_key(avoid=None):
