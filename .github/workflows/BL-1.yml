@@ -90,72 +90,7 @@ jobs:
           can_upload=$(jq -r '.can_upload // true' /tmp/pd_user.json)
           echo "Pixeldrain user: $(jq -r '.username' /tmp/pd_user.json) | can_upload=$can_upload"
           [ "$can_upload" != "false" ] || { echo '::error::Tài khoản Pixeldrain chưa được phép upload (cần xác minh email)'; exit 1; }
-      - name: Test Revid TTS API (smoke test, stop early if it fails)
-        env:
-          REVID_API_KEY: ${{ secrets.REVID_API_KEY }}
-          REVID_VOICE_ID: "3001"
-          REVID_LANGUAGE: "vi-VN"
-          REVID_RATE: "0%"
-        run: |
-          set -euo pipefail
-          mkdir -p work
-          python3 <<'PY'
-          import os, sys, base64, subprocess
-          from urllib.parse import urlparse
-          import numpy as np
-          import requests
-          API_URL = "https://tts.revidapi.com/api/v1/tts"
-          key = os.environ.get("REVID_API_KEY", "").strip()
-          if not key:
-              raise SystemExit("Missing GitHub secret REVID_API_KEY")
-          payload = {
-              "text": "Xin chào, đây là bài kiểm tra giọng nói của tôi.",
-              "voice_id": int(os.environ["REVID_VOICE_ID"]),
-              "language": os.environ["REVID_LANGUAGE"],
-              "rate": os.environ["REVID_RATE"],
-              "return_base64": True,
-          }
-          headers = {
-              "Content-Type": "application/json",
-              "Accept": "application/json",
-              "x-api-key": key,
-              "x-revidapi-client": "tts-studio",
-          }
-          r = requests.post(API_URL, json=payload, headers=headers, timeout=100)
-          print(f"HTTP {r.status_code}")
-          try:
-              data = r.json()
-          except ValueError:
-              raise SystemExit(f"Revid API trả về không phải JSON: {r.text[:300]}")
-          if r.status_code != 200 or not data.get("success"):
-              raise SystemExit(f"Revid API lỗi: {data.get('error')} | {str(data)[:300]}")
-          audio = None
-          b64 = data.get("audio_base64")
-          if b64:
-              if b64.startswith("data:"):
-                  b64 = b64.split(",", 1)[1]
-              audio = base64.b64decode(b64)
-          if not audio and data.get("audio_url"):
-              u = urlparse(data["audio_url"])
-              if u.scheme != "https" or (u.hostname or "").lower() != "tts.revidapi.com":
-                  raise SystemExit("audio_url không hợp lệ")
-              rr = requests.get(data["audio_url"], timeout=90, allow_redirects=False)
-              rr.raise_for_status()
-              audio = rr.content
-          if not audio:
-              raise SystemExit("API không trả về dữ liệu MP3")
-          open("work/test_1.mp3", "wb").write(audio)
-          p = subprocess.run(
-              ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "work/test_1.mp3",
-               "-f", "f32le", "-ar", "24000", "-ac", "1", "pipe:1"],
-              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-          a = np.frombuffer(p.stdout, dtype="<f4")
-          dur = len(a) / 24000.0
-          peak = float(np.abs(a).max()) if a.size else 0.0
-          print(f"Test OK: dur={dur:.2f}s peak={peak:.3f} bytes={len(audio)}")
-          if a.size == 0 or not np.isfinite(a).all() or peak < 0.01 or dur < 0.5:
-              raise SystemExit("Revid test audio is empty/invalid -> stop workflow")
-          PY
+
       # ============================================================
       # TỪ ĐÂY TRỞ XUỐNG: TẢI VIDEO + OCR + DỊCH + TTS
       # ============================================================
@@ -1309,16 +1244,18 @@ jobs:
       - name: TTS Generation (Revid TTS API + Vietnamese VTT)
         env:
           REVID_API_KEYS: ${{ secrets.REVID_API_KEYS }}   # mỗi dòng 1 key
-          REVID_VOICE_ID: "3001"       # voice_id của Revid
+          REVID_VOICE_ID: "3001"
           REVID_LANGUAGE: "vi-VN"
-          REVID_RATE: "0%"             # tốc độ do API xử lý (0% = gốc). Việc tăng tốc để khớp thời gian làm ở bước mix
-          TTS_SPEEDUP: "1.0"           # tăng tốc thêm bằng ffmpeg atempo sau khi nhận mp3 (1.0 = giữ nguyên)
-          TTS_WORKERS: "1"             # số request song song tới API (giảm xuống 1-2 nếu bị 429)
-          TTS_MAX_RETRIES: "3"         # thử lại khi API trả 429/5xx hoặc lỗi mạng
-          TTS_ERROR_RATIO: "0.1"     # quá số đoạn lỗi này thì dừng workflow
+          REVID_RATE: "0%"
+          TTS_SPEEDUP: "1.0"
+          TTS_WORKERS: "4"             # thử lại 4 để so sánh tốc độ với workers=1
+          TTS_MAX_RETRIES: "3"
+          TTS_TIMEOUT: "100"           # timeout mỗi request (giây)
+          TTS_HEARTBEAT: "20"          # cứ N giây in danh sách request đang chờ
+          TTS_ERROR_RATIO: "0.1"
         run: |
           python3 <<'PY'
-          import os, re, sys, time, base64, subprocess, logging, random
+          import os, re, sys, time, base64, subprocess, logging, random, threading, unicodedata
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from urllib.parse import urlparse
           import numpy as np
@@ -1326,7 +1263,6 @@ jobs:
           import webvtt
           logging.basicConfig(level=logging.INFO, format="%(message)s")
           API_URL = "https://tts.revidapi.com/api/v1/tts"
-          # ---- Đọc tất cả API key từ REVID_API_KEYS (mỗi dòng 1 key), loại trùng ----
           API_KEYS = []
           for k in os.environ.get("REVID_API_KEYS", "").splitlines():
               k = k.strip()
@@ -1338,9 +1274,34 @@ jobs:
           TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.0"))
           WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "2")))
           MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
+          TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "100"))
+          HEARTBEAT = float(os.environ.get("TTS_HEARTBEAT", "20"))
           ERROR_RATIO = float(os.environ.get("TTS_ERROR_RATIO", "0.1"))
+          T0 = time.time()
+          LOCK = threading.Lock()
+          INFLIGHT = {}     # i -> (key_index, attempt, t_start)
+          KEY_STATS = {}    # key_index -> {"n":..,"ok":..,"err":..,"sec":..}
+          def log(msg):
+              with LOCK:
+                  print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)
+          def stat(ki, ok, sec):
+              with LOCK:
+                  s = KEY_STATS.setdefault(ki, {"n": 0, "ok": 0, "err": 0, "sec": 0.0})
+                  s["n"] += 1
+                  s["ok" if ok else "err"] += 1
+                  s["sec"] += sec
+          def heartbeat(stop):
+              while not stop.wait(HEARTBEAT):
+                  with LOCK:
+                      items = sorted(INFLIGHT.items())
+                  now = time.time()
+                  if items:
+                      desc = " | ".join(f"c{i}: key#{ki + 1} lan{att} cho {now - t:.0f}s"
+                                        for i, (ki, att, t) in items)
+                      log(f"[HEARTBEAT] dang cho {len(items)} request: {desc}")
+                  else:
+                      log("[HEARTBEAT] khong co request nao dang cho")
           def pick_key(avoid=None):
-              """Chọn ngẫu nhiên 1 key. Nếu có nhiều key, tránh key vừa lỗi (avoid = index)."""
               idxs = list(range(len(API_KEYS)))
               if avoid is not None and len(idxs) > 1:
                   idxs = [i for i in idxs if i != avoid]
@@ -1353,27 +1314,24 @@ jobs:
                   "x-api-key": key,
                   "x-revidapi-client": "tts-studio",
               }
-          import unicodedata
           def normalize_for_tts(text):
-              text = unicodedata.normalize("NFKC", text)   # full-width -> ASCII, … -> ...
-              text = re.sub(r"\{[^}]*\}", " ", text)        # tag ASS
-              text = re.sub(r"<[^>]+>", " ", text)          # tag HTML
+              text = unicodedata.normalize("NFKC", text)
+              text = re.sub(r"\{[^}]*\}", " ", text)
+              text = re.sub(r"<[^>]+>", " ", text)
               text = text.replace("\\N", " ").replace("\\n", " ")
-              # bỏ chữ Hán / ký tự CJK và dấu câu CJK còn sót
               text = re.sub(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff]", " ", text)
               text = re.sub(r"[‘’´`]", "'", text)
               text = re.sub(r"[–—―]", "-", text)
               text = text.lower()
               text = re.sub(r"\b([a-zà-ỹđ])-\1", r"\1", text)
-              # chỉ giữ chữ, số, khoảng trắng và vài dấu câu cơ bản
               text = re.sub(r"[^\w\s,.!?;:'%-]|_", " ", text)
-              text = re.sub(r"\.{2,}", ".", text)            # ... -> .
-              text = re.sub(r"([,;:!?])\1+", r"\1", text)    # !!! -> !
-              text = re.sub(r"\s+([,.;:!?])", r"\1", text)   # bỏ khoảng trắng trước dấu
+              text = re.sub(r"\.{2,}", ".", text)
+              text = re.sub(r"([,;:!?])\1+", r"\1", text)
+              text = re.sub(r"\s+([,.;:!?])", r"\1", text)
               text = re.sub(r"([,;:!?])(?=\S)", r"\1 ", text)
-              text = re.sub(r"\.(?=[^\W\d_])", ". ", text)   # chỉ thêm cách sau '.' khi kế tiếp là chữ, giữ nguyên 3.5
+              text = re.sub(r"\.(?=[^\W\d_])", ". ", text)
               text = re.sub(r"\s+", " ", text).strip(" ,.;:-'")
-              if not re.search(r"\w", text):                 # chỉ còn ký tự rác -> bỏ cue
+              if not re.search(r"\w", text):
                   return ""
               if not text.endswith((".", "!", "?")):
                   text += "."
@@ -1387,7 +1345,6 @@ jobs:
                   input=mp3_bytes, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
               return np.frombuffer(p.stdout, dtype="<f4").copy(), sr
           def plausible(a, sr, text):
-              """Loai bo audio rong / vo am / dai bat thuong."""
               if a.size == 0 or not np.isfinite(a).all():
                   return False
               if float(np.abs(a).max()) < 0.01:
@@ -1395,8 +1352,7 @@ jobs:
               dur = len(a) / float(sr)
               w = max(1, n_words(text))
               return max(0.15, 0.08 * w) <= dur <= 0.9 * w + 2.5
-          def fetch_mp3(text):
-              """Goi Revid TTS API (moi lan goi random 1 key), tra ve bytes mp3. Retry khi 429/5xx/loi mang."""
+          def fetch_mp3(i, text):
               payload = {
                   "text": text,
                   "voice_id": VOICE_ID,
@@ -1405,19 +1361,31 @@ jobs:
                   "return_base64": True,
               }
               last = "unknown"
-              bad_key = None   # key vua loi -> lan retry uu tien key khac
-              for attempt in range(MAX_RETRIES):
+              bad_key = None
+              for attempt in range(1, MAX_RETRIES + 1):
                   ki, key = pick_key(avoid=bad_key)
+                  t_req = time.time()
+                  with LOCK:
+                      INFLIGHT[i] = (ki, attempt, t_req)
+                  log(f"c{i} GUI key#{ki + 1} lan {attempt}/{MAX_RETRIES} | {len(text)} ky tu, "
+                      f"{n_words(text)} tu | {text[:60]!r}")
                   try:
-                      r = requests.post(API_URL, json=payload, headers=make_headers(key), timeout=100)
+                      r = requests.post(API_URL, json=payload, headers=make_headers(key), timeout=TIMEOUT)
+                      el = time.time() - t_req
+                      log(f"c{i} NHAN key#{ki + 1} lan {attempt} | HTTP {r.status_code} | "
+                          f"{el:.1f}s | {len(r.content) / 1024:.1f} KB")
                       if r.status_code in (429, 500, 502, 503, 504):
+                          stat(ki, False, el)
                           last = f"HTTP {r.status_code} (key #{ki + 1})"
                           bad_key = ki
-                          time.sleep(3 * (attempt + 1))
+                          log(f"c{i} LOI TAM THOI {last} | body: {r.text[:200]!r} | cho {3 * attempt}s roi thu lai")
+                          time.sleep(3 * attempt)
                           continue
                       data = r.json()
                       if r.status_code != 200 or not data.get("success"):
-                          raise RuntimeError(f"API loi HTTP {r.status_code} (key #{ki + 1}): {data.get('error')}")
+                          stat(ki, False, el)
+                          raise RuntimeError(f"API loi HTTP {r.status_code} (key #{ki + 1}): "
+                                             f"{data.get('error')} | {str(data)[:200]}")
                       audio = None
                       b64 = data.get("audio_base64")
                       if b64:
@@ -1428,19 +1396,29 @@ jobs:
                           u = urlparse(data["audio_url"])
                           if u.scheme != "https" or (u.hostname or "").lower() != "tts.revidapi.com":
                               raise RuntimeError("audio_url khong hop le")
+                          t_dl = time.time()
                           rr = requests.get(data["audio_url"], timeout=90, allow_redirects=False)
                           rr.raise_for_status()
                           audio = rr.content
+                          log(f"c{i} tai audio_url mat {time.time() - t_dl:.1f}s")
                       if not audio:
+                          stat(ki, False, el)
                           raise RuntimeError("API khong tra ve du lieu MP3")
+                      stat(ki, True, el)
                       return audio
                   except (requests.RequestException, ValueError) as e:
+                      el = time.time() - t_req
+                      stat(ki, False, el)
                       last = f"{e!r} (key #{ki + 1})"
                       bad_key = ki
-                      time.sleep(3 * (attempt + 1))
+                      log(f"c{i} LOI MANG/JSON key#{ki + 1} lan {attempt} sau {el:.1f}s: {e!r} | "
+                          f"cho {3 * attempt}s roi thu lai")
+                      time.sleep(3 * attempt)
+                  finally:
+                      with LOCK:
+                          INFLIGHT.pop(i, None)
               raise RuntimeError(f"het {MAX_RETRIES} lan thu: {last}")
           def save_mp3(mp3_bytes, out):
-              """Ghi chunks/c_i.mp3. Chi re-encode (atempo) neu TTS_SPEEDUP != 1.0."""
               if abs(TTS_SPEEDUP - 1.0) > 0.01:
                   subprocess.run(
                       ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
@@ -1453,17 +1431,19 @@ jobs:
                   raise RuntimeError("Empty mp3")
           def process(i, text):
               out = f"chunks/c_{i}.mp3"
+              t_all = time.time()
               try:
-                  mp3 = fetch_mp3(text)
+                  mp3 = fetch_mp3(i, text)
                   a, sr = decode_mp3(mp3)
+                  dur = len(a) / float(sr)
                   if not plausible(a, sr, text):
-                      return i, text, False, f"bat thuong (dur={len(a) / float(sr):.2f}s, {n_words(text)} tu)"
+                      return i, text, False, f"bat thuong (dur={dur:.2f}s, {n_words(text)} tu)", time.time() - t_all, dur
                   save_mp3(mp3, out)
-                  return i, text, True, ""
+                  return i, text, True, "", time.time() - t_all, dur
               except Exception as e:
                   if os.path.exists(out):
                       os.remove(out)
-                  return i, text, False, str(e)
+                  return i, text, False, str(e), time.time() - t_all, 0.0
           def main():
               if not API_KEYS:
                   print("Missing GitHub secret REVID_API_KEYS"); sys.exit(1)
@@ -1473,34 +1453,44 @@ jobs:
               vtt = webvtt.read(vtt_path)
               os.makedirs("chunks", exist_ok=True)
               total = len(vtt)
-              print(f"[Revid] keys={len(API_KEYS)} | voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
-                    f"speedup={TTS_SPEEDUP} | workers={WORKERS} | cues={total}", flush=True)
+              log(f"[Revid] keys={len(API_KEYS)} | voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
+                  f"speedup={TTS_SPEEDUP} | workers={WORKERS} | timeout={TIMEOUT:.0f}s | cues={total}")
               jobs = []
               for i, c in enumerate(vtt):
                   text = normalize_for_tts(c.text)
                   if not text or text == ".":
-                      # cue rỗng: không tạo file, bước mix sẽ coi là im lặng
                       continue
                   jobs.append((i, text))
               ERROR_THRESHOLD = max(1, int(len(jobs) * ERROR_RATIO))
-              print(f"[Revid] Dừng nếu lỗi >= {ERROR_THRESHOLD}/{len(jobs)} đoạn", flush=True)
-              failed = []   # (index, text)
+              log(f"[Revid] jobs={len(jobs)} | Dung neu loi >= {ERROR_THRESHOLD}/{len(jobs)} doan")
+              failed = []
               made = 0
               done = 0
-              t0 = time.time()
+              stop = threading.Event()
+              threading.Thread(target=heartbeat, args=(stop,), daemon=True).start()
               with ThreadPoolExecutor(max_workers=WORKERS) as ex:
                   futs = [ex.submit(process, i, t) for i, t in jobs]
                   for fut in as_completed(futs):
-                      i, text, ok, msg = fut.result()
+                      i, text, ok, msg, took, dur = fut.result()
                       done += 1
                       if ok:
                           made += 1
+                          log(f"c{i} XONG OK | tong {took:.1f}s | audio {dur:.2f}s | [{done}/{len(jobs)}]")
                       else:
                           failed.append((i, text))
-                          print(f"[Revid] doan {i} loi -> bo qua: {msg}", flush=True)
-                      if done % 20 == 0 or done == len(jobs):
-                          el = time.time() - t0
-                          print(f"TTS {done}/{len(jobs)} | ok={made} | loi={len(failed)} | {el:.0f}s", flush=True)
+                          log(f"c{i} THAT BAI -> bo qua | tong {took:.1f}s | {msg} | [{done}/{len(jobs)}]")
+                      if done % 5 == 0 or done == len(jobs):
+                          el = time.time() - T0
+                          rate = done / el * 60 if el > 0 else 0
+                          eta = (len(jobs) - done) / (done / el) / 60 if done else 0
+                          log(f"[TIEN DO] {done}/{len(jobs)} | ok={made} | loi={len(failed)} | "
+                              f"{rate:.1f} cau/phut | con lai ~{eta:.0f} phut")
+              stop.set()
+              log("[THONG KE THEO KEY]")
+              for ki in sorted(KEY_STATS):
+                  s = KEY_STATS[ki]
+                  avg = s["sec"] / s["n"] if s["n"] else 0
+                  log(f"  key#{ki + 1}: {s['n']} request | ok={s['ok']} loi={s['err']} | trung binh {avg:.1f}s/request")
               failed.sort()
               failed_count = len(failed)
               print(f"Tổng số đoạn lỗi: {failed_count}")
