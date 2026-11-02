@@ -1,0 +1,393 @@
+name: "[2/2] Pixeldrain → Render Vietsub + HLS → Cloudflare Pages"
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: "Link Pixeldrain"
+        required: true
+        type: string
+      slug:
+        description: "slug"
+        required: true
+        type: string
+      token:
+        description: "token"
+        required: true
+        type: string
+      page:
+        description: "page"
+        required: true
+        type: string
+      account:
+        description: "account"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+      LC_ALL: "C.UTF-8"
+      LANG: "C.UTF-8"
+      # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
+      X264_PRESET: "medium"
+      X264_CRF: "22"
+      SLUG: ${{ inputs.slug }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          PIXEL_LINK: ${{ inputs.link }}
+        run: |
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
+          # link phải dạng https://pixeldrain.com/u/ID -> tách ID
+          if [[ "$PIXEL_LINK" =~ ^https://pixeldrain\.com/u/([A-Za-z0-9_-]+)/?$ ]]; then
+            echo "PIXEL_ID=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+            echo "Pixeldrain ID: ${BASH_REMATCH[1]}"
+          else
+            echo '::error::link phải có dạng https://pixeldrain.com/u/ID'
+            exit 1
+          fi
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-core fontconfig unzip
+          # Cài font Oswald từ file zip có sẵn trong repo (bỏ variable font, chỉ dùng static)
+          sudo mkdir -p /usr/local/share/fonts/oswald
+          sudo unzip -o -j Oswald.zip '*.ttf' -x '*VariableFont*' -d /usr/local/share/fonts/oswald
+          sudo fc-cache -f
+          fc-list | grep -i oswald || { echo '::error::Không cài được font Oswald'; exit 1; }
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-render-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            pip-render-${{ runner.os }}-
+      - name: Install Python packages
+        run: |
+          set -eux
+          python -m pip install --upgrade pip
+          python -m pip install \
+            opencv-python-headless \
+            pysubs2 \
+            numpy \
+            requests
+          python3 <<'PY'
+          import cv2, pysubs2, numpy, requests
+          print("ALL IMPORTS OK")
+          PY
+      - name: Prepare directories
+        run: |
+          set -eux
+          mkdir -p work output dl
+      # ============================================================
+      # TẢI FILE ZIP TỪ PIXELDRAIN (tải ẩn danh, resume + kiểm tra sha256) -> GIẢI NÉN
+      # ============================================================
+      - name: Download zip from Pixeldrain and extract
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+
+          DL_URL="https://pixeldrain.com/api/file/${PIXEL_ID}?download"
+          INFO_URL="https://pixeldrain.com/api/file/${PIXEL_ID}/info"
+
+          # Lấy thông tin file (size + sha256) để kiểm tra sau khi tải
+          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "$INFO_URL" || true)
+          want=$(jq -r '.hash_sha256 // empty' <<<"$info" 2>/dev/null || true)
+          size=$(jq -r '.size // 0' <<<"$info" 2>/dev/null || echo 0)
+          avail=$(jq -r '.availability // empty' <<<"$info" 2>/dev/null || true)
+          echo "[INFO] id=$PIXEL_ID size=$((size / 1048576)) MB sha256=${want:-?} availability=${avail:-ok}"
+          if [ -n "$avail" ]; then
+            echo "::warning::Pixeldrain báo file bị hạn chế: $avail (có thể cần captcha / bị giới hạn tải)"
+          fi
+
+          is_ok() {
+            [ -s pixel.zip ] || return 1
+            if [ -n "$want" ]; then
+              [ "$(sha256sum pixel.zip | cut -d' ' -f1)" = "$want" ]
+            else
+              unzip -tq pixel.zip >/dev/null 2>&1
+            fi
+          }
+
+          ok=0
+          for attempt in $(seq 1 10); do
+            if is_ok; then ok=1; break; fi
+            # Đã đủ dung lượng mà vẫn sai hash/hỏng -> xóa tải lại từ đầu
+            if [ -f pixel.zip ] && [ "$size" -gt 0 ] && [ "$(stat -c %s pixel.zip)" -ge "$size" ]; then
+              echo "::warning::pixel.zip đủ dung lượng nhưng sai, tải lại từ đầu."
+              rm -f pixel.zip
+            fi
+            echo "[GET] attempt $attempt/10"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - \
+              "$DL_URL" -o pixel.zip \
+              || echo "::warning::curl lỗi lần $attempt, thử tiếp (resume)."
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ] && is_ok; then ok=1; fi
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Không tải được file Pixeldrain '$PIXEL_ID' hợp lệ sau 10 lần thử (kiểm tra link / giới hạn tải của Pixeldrain)."
+            exit 1
+          fi
+          echo "[OK] pixel.zip hợp lệ"
+          ls -lh pixel.zip
+
+          # Giải nén
+          unzip -o -q pixel.zip -d dl
+          for f in raw_video.mp4 mixed_audio.m4a vietnamese.srt vietnamese.vtt subtitle_geometry.json static_regions.json; do
+            [ -s "dl/$f" ] || { echo "::error::Trong zip thiếu file '$f'"; exit 1; }
+          done
+          mv dl/raw_video.mp4 raw_video.mp4
+          mv dl/mixed_audio.m4a dl/vietnamese.srt dl/vietnamese.vtt \
+             dl/subtitle_geometry.json dl/static_regions.json work/
+          rm -rf dl pixel.zip
+
+          ls -lh raw_video.mp4 work/
+      - name: Validate downloaded media
+        run: |
+          set -euo pipefail
+          V=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4)
+          A=$(ffprobe -v error -show_entries format=duration -of csv=p=0 work/mixed_audio.m4a)
+          echo "video=${V}s | mixed_audio=${A}s"
+          python3 - "$V" "$A" <<'PY'
+          import sys
+          v, a = float(sys.argv[1]), float(sys.argv[2])
+          if v <= 0 or a <= 0:
+              print("::error::Duration không hợp lệ")
+              sys.exit(1)
+          if abs(v - a) > 10:
+              print(f"::error::Audio lệch {abs(v - a):.1f}s so với video, file có thể hỏng.")
+              sys.exit(1)
+          PY
+      # ============================================================
+      # RENDER: blur sub gốc + che watermark + burn sub Việt + ghép audio mix sẵn
+      # ============================================================
+      - name: Render Vietnamese video and HLS with detected subtitle blur
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, math, re, subprocess
+          from pathlib import Path
+          import cv2
+          import numpy as np
+          import pysubs2
+          geo = json.loads(Path("work/subtitle_geometry.json").read_text(encoding="utf-8"))
+          if not geo.get("valid") or not geo.get("blur"):
+              raise SystemExit("Subtitle geometry was not validated; refusing to render.")
+          width, height = int(geo["video_width"]), int(geo["video_height"])
+          blur = geo["blur"]
+          sub_h = int(geo["subtitle_height"])
+          center_x, center_y = width // 2, int(geo["subtitle_center_y"])
+          blur_w, blur_h = int(blur["width"]), int(blur["height"])
+          blur_x, blur_y = int(blur["x"]), int(blur["y"])
+          sigma = max(24, int(round(sub_h * .80)))
+          feather_x = max(8, int(round(blur_h * .27)))
+          feather_y = max(3, int(round(blur_h * .09)))
+          vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
+          max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
+          FONT_SCALE = 1.25
+          font_size = max(45, int(sub_h * .90 * FONT_SCALE))
+          font_size = min(font_size, max(45, int(width * .80 / max(1, max_chars * .50))))
+          ass = [
+              "[Script Info]", "Title: Vietnamese hard subtitles",
+              "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}",
+              "WrapStyle: 2", "ScaledBorderAndShadow: yes", "",
+              "[V4+ Styles]",
+              "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
+              f"Style: Default,Oswald,{font_size},&H0000FFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,0,1",
+              "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
+          ]
+          def ass_time(ms):
+              total = max(0, int(ms))
+              h, total = divmod(total, 3600000)
+              m, total = divmod(total, 60000)
+              sec, total = divmod(total, 1000)
+              return f"{h}:{m:02}:{sec:02}.{total // 10:02}"
+          for ev in vi.events:
+              text = ev.text.replace("\\N", "\\N").replace("\n", "\\N")
+              text = text.replace("{", "\\{").replace("}", "\\}")
+              ass.append(
+                  f"Dialogue: 0,{ass_time(ev.start)},{ass_time(ev.end)},Default,,0,0,0,,"
+                  f"{{\\an5\\pos({center_x},{center_y})}}{text}"
+              )
+          Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
+          def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
+              """Mat na alpha feather. sides = (trai, phai, tren, duoi); 0 = canh do KHONG feather
+              (dung cho canh sat mep video de dai sat mep van duoc lam mo 100%)."""
+              fx, fy = float(max(1, fx)), float(max(1, fy))
+              xs = np.arange(w, dtype=np.float32)[None, :]
+              ys = np.arange(h, dtype=np.float32)[:, None]
+              big = np.float32(1e6)
+              l = xs / fx if sides[0] else big
+              r = (w - 1 - xs) / fx if sides[1] else big
+              t = ys / fy if sides[2] else big
+              b = (h - 1 - ys) / fy if sides[3] else big
+              alpha = np.clip(np.minimum(np.minimum(l, r), np.minimum(t, b)), 0.0, 1.0)
+              alpha = np.broadcast_to(alpha, (h, w))
+              cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
+          feather_mask(blur_w, blur_h, feather_x, feather_y, "work/blur_mask.png")
+          # ---- Vùng che cố định (watermark / quảng cáo 2 bên / FULL góc) từ bước static_detect ----
+          regions = []
+          sp = Path("work/static_regions.json")
+          if sp.exists():
+              try:
+                  regions = json.loads(sp.read_text(encoding="utf-8")).get("regions", [])
+              except Exception:
+                  regions = []
+          clean = []
+          for r in regions:
+              x, y, w, h = int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])
+              x -= x % 2; y -= y % 2
+              w = min(w, width - x) // 2 * 2
+              h = min(h, height - y) // 2 * 2
+              if w >= 16 and h >= 12:
+                  clean.append((x, y, w, h, r.get("feather", [1, 1, 1, 1])))
+          regions = clean
+          for old in Path("work").glob("static_mask_*.png"):
+              old.unlink()
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              fx = max(4, int(round(min(w, h) * .18)))
+              feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png", sides=fs)
+          # Input: 0 = raw_video.mp4, 1 = work/mixed_audio.m4a, 2 = work/blur_mask.png (lặp),
+          #        3.. = work/static_mask_k.png (lặp)
+          n_split = 2 + len(regions)
+          graph = ["[0:v]split=%d[vbase][vpatchsrc]" % n_split
+                   + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
+          cur = "vbase"
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              sg = max(10, min(60, int(round(h * .60))))
+              graph.append(
+                  f"[sp{k}]crop={w}:{h}:{x}:{y},gblur=sigma={sg},format=rgb24[sb{k}];"
+                  f"[{3 + k}:v]format=gray[sm{k}];"
+                  f"[sb{k}][sm{k}]alphamerge[sq{k}];"
+                  f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
+              )
+              cur = f"sv{k}"
+          graph.append(
+              f"[vpatchsrc]crop={blur_w}:{blur_h}:{blur_x}:{blur_y},"
+              f"gblur=sigma={sigma},format=rgb24[vblur];"
+              f"[2:v]format=gray[vmask];"
+              f"[vblur][vmask]alphamerge[vpatch];"
+              f"[{cur}][vpatch]overlay=x={blur_x}:y={blur_y}:shortest=1,"
+              f"subtitles=work/vietnamese-overlay.ass[v]"
+          )
+          video_graph = "".join(graph)
+          Path("work/render-filter.txt").write_text(video_graph + "\n", encoding="utf-8")
+          print(f"Subtitle text bbox: center_y={center_y}, height={sub_h}px")
+          print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}; fixed for full video.")
+          print(f"Static overlay blur regions: {len(regions)}")
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              print(f"  [{k}] x={x} y={y} w={w} h={h} feather(l,r,t,b)={fs}")
+          print(f"Vietnamese overlay: centered at ({center_x},{center_y}), font={font_size}px.")
+          PY
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
+          # Mỗi vùng che cố định cần 1 input mặt nạ lặp (input 3, 4, ...)
+          EXTRA=()
+          for m in $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
+            EXTRA+=(-loop 1 -framerate 30 -t "$DUR" -i "$m")
+          done
+          ffmpeg -y -i raw_video.mp4 -i work/mixed_audio.m4a \
+            -loop 1 -framerate 30 -t "$DUR" -i work/blur_mask.png \
+            "${EXTRA[@]}" \
+            -filter_complex_script work/render-filter.txt \
+            -map "[v]" -map 1:a:0 \
+            -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
+            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -pix_fmt yuv420p \
+            -c:a copy \
+            -t "$DUR" final.mp4
+          mkdir -p output
+          ffmpeg -y -i final.mp4 -c copy -f hls \
+            -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
+            -hls_fmp4_init_filename "${{ inputs.slug }}-index.png" \
+            -hls_segment_filename "output/${{ inputs.slug }}-index%d.png" \
+            "output/${{ inputs.slug }}.m3u8"
+      - name: Copy subtitle file into output folder
+        run: |
+          set -eux
+          cp work/vietnamese.vtt "output/${{ inputs.slug }}.vtt"
+          ls -lh output/
+      - name: Deploy to Cloudflare Pages (first)
+        id: deploy1
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
+
+      - name: Verify Cloudflare deployment (branch domain check)
+        id: verify
+        continue-on-error: true
+        env:
+          PROJECT: ${{ github.event.inputs.page }}
+          BRANCH: ${{ github.event.inputs.slug }}
+        run: |
+          set -e
+          FILE_URL="https://${{ github.event.inputs.slug }}.${{ github.event.inputs.page }}.pages.dev/${{ github.event.inputs.slug }}.m3u8"
+
+          echo "[TARGET] $FILE_URL"
+
+          check () {
+            code=$(curl -L -o /dev/null -s -w "%{http_code}" "$FILE_URL")
+            echo "HTTP CODE: $code"
+            [ "$code" = "200" ]
+          }
+
+          # Báo về ViCDN khi deploy thành công (dùng chung cho cả 2 lần check)
+          notify () {
+            curl -G "https://cp.ssplay.net/vicdn.php" \
+              --data-urlencode "type=ok0" \
+              --data-urlencode "key=${PROJECT}" \
+              --data-urlencode "slug=${BRANCH}" || true
+            curl -L -A "MySecretAgent_ViCDN_cc" "https://vicdn.cc/${BRANCH}?r=1" || true
+          }
+
+          echo "[WAIT] Waiting 1 minutes for Pages propagation..."
+          sleep 60
+
+          echo "[CHECK #1]"
+          if check; then
+            echo "[SUCCESS] File exists"
+            notify
+            exit 0
+          fi
+
+          echo "[WAIT] Still not found, wait extra 3 minutes..."
+          sleep 180
+
+          echo "[CHECK #2]"
+          if check; then
+            echo "[SUCCESS] File exists after delay"
+            notify
+            exit 0
+          fi
+
+          echo "[FAIL] File still missing → mark for redeploy"
+          echo "NEED_REDEPLOY=true" >> $GITHUB_ENV
+          exit 1
+
+      - name: Deploy to Cloudflare Pages (retry – reuse encoded files)
+        if: env.NEED_REDEPLOY == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
