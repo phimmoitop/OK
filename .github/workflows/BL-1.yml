@@ -75,7 +75,7 @@ jobs:
           print("ALL IMPORTS OK")
           PY
       # ============================================================
-      # SMOKE TEST: PIXELDRAIN API KEY + REVID TTS. Lỗi thì dừng ngay.
+      # SMOKE TEST: PIXELDRAIN API KEY. Lỗi thì dừng ngay.
       # ============================================================
       - name: Test Pixeldrain API key (smoke test, stop early if it fails)
         env:
@@ -90,9 +90,8 @@ jobs:
           can_upload=$(jq -r '.can_upload // true' /tmp/pd_user.json)
           echo "Pixeldrain user: $(jq -r '.username' /tmp/pd_user.json) | can_upload=$can_upload"
           [ "$can_upload" != "false" ] || { echo '::error::Tài khoản Pixeldrain chưa được phép upload (cần xác minh email)'; exit 1; }
-
       # ============================================================
-      # TỪ ĐÂY TRỞ XUỐNG: TẢI VIDEO + OCR + DỊCH + TTS
+      # TỪ ĐÂY TRỞ XUỐNG: TẢI VIDEO + OCR + DỊCH + HOÀN THIỆN SUB + TTS
       # ============================================================
       - name: Prepare directories
         run: |
@@ -153,25 +152,21 @@ jobs:
             --merge-output-format mp4
             -o "raw_video.mp4"
           )
-
           show_status() {
             echo "--- Trạng thái file đã tải ---"
             ls -lh raw_video* 2>/dev/null || echo "(chưa có file nào)"
             echo "------------------------------"
           }
-
           # Kiểm tra file cuối có hợp lệ không (không bị cụt / hỏng)
           valid_video() {
             [ -s raw_video.mp4 ] || return 1
             d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4 2>/dev/null)
             [ -n "$d" ] && [ "$d" != "N/A" ]
           }
-
           ok=0
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "=== attempt $attempt/$MAX_ATTEMPTS: yt-dlp native (resume) ==="
             show_status
-
             # yt-dlp tự bỏ qua stream đã tải xong và chỉ tải tiếp phần còn thiếu.
             # Mỗi lần chạy lại sẽ lấy link mới (có thể trúng mirror CDN khác).
             if yt-dlp "${COMMON[@]}" "$BILIBILI_URL"; then
@@ -181,34 +176,36 @@ jobs:
               echo "::warning::File ghép xong nhưng không hợp lệ, xóa file ghép và thử lại."
               rm -f raw_video.mp4
             fi
-
             echo "::warning::Attempt $attempt thất bại, giữ lại phần đã tải để tải tiếp."
             [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep $(( attempt * 8 > 60 ? 60 : attempt * 8 ))
           done
-
           if [ "$ok" -ne 1 ]; then
             echo "::error::Khong tai duoc video Bilibili sau $MAX_ATTEMPTS lan thu (CDN tu choi IP runner)."
             show_status
             exit 1
           fi
           ls -lh raw_video.mp4
+      # ============================================================
+      # OCR: neo 30s + chia doan theo y (CHAT HON), dai FAST khit 1 dong,
+      #      chong rac, gop cue trung lap ngay trong OCR
+      # ============================================================
       - name: Create OCR script
         run: |
           cat > ocr_run.py <<'PY'
           """
           OCR sub cung (hardsub) theo DIEM NEO (anchor) moi 30s.
-
-          1) Chia video thanh cac cua so 30s. Moi cua so lay ~8 frame, det+rec tren vung rong
-             -> tim dai (band) chua sub => 1 diem neo (cy, chieu cao chu, thoi diem thay sub dau/cuoi).
-             Chu TINH (watermark/logo) duoc loai tren TOAN BO mau (khong phai tung cua so).
-          2) Cua so khong co sub -> khong tao neo (se dung vi tri neo truoc/sau).
-          3) Gom cac neo lien tiep co cy gan nhau thanh 1 DOAN (segment). Neu 2 neo lien ke
-             lech y -> DO NHI PHAN giua 2 neo de tim thoi diem doi vi tri (~1.5s).
-          4) OCR toan video 3fps, moi doan dung dai mong rieng cua no. Che do FAST (chi rec)
-             duoc tu kiem tra 1 lan tren toan bo cac neo.
+          1) Moi cua so 30s lay ~8 frame, det+rec tren vung rong -> dai (band) chua sub
+             -> 1 diem neo (cy, th). th do bang TRUNG VI CHIEU CAO TUNG BOX (khong dung union).
+             Chu TINH (watermark/logo) duoc loai tren TOAN BO mau.
+          2) Gom neo thanh DOAN vi tri. Mac dinh la 1 doan; chi tach doan khi >= 2 neo lien tiep
+             cung lech y (> 0.8 * chieu cao chu). Neo le loi bi bo. Neu do nhi phan that bai thi
+             2 doan CHONG LAN len khoang khong chac chan (khong tin diem giua).
+          3) FAST (rec-only) chi bat khi: dai khit 1 dong + do khop cao + ti le rac thap.
+             FAST loc diem >= 0.70 va dung lai ket qua khi chu khong doi (on dinh chu).
+          4) Gop cue: gop frame lien tiep, roi gop tiep cac cue gan nhau (<= 1s) co chu gan giong.
           5) Xuat work/subtitle_geometry.json dang { segments: [ {t_start,t_end,center_y,height,blur{}} ] }.
           """
-          import cv2, json, math, os, re, subprocess, sys, time
+          import cv2, json, math, os, random, re, subprocess, sys, time
           import multiprocessing as mp
           import numpy as np
           from pathlib import Path
@@ -219,15 +216,21 @@ jobs:
           STEP = 1.0 / FPS
           WIN = 30.0               # khoang cach giua 2 diem neo (giay)
           SAMPLES_PER_WIN = 8      # so frame mau moi cua so (video ngan se tu tang)
-          MIN_WIN_FRAMES = 2       # cua so can >= N frame co sub moi tao neo
+          MIN_WIN_FRAMES = 3       # cua so can >= N frame co sub moi tao neo (cu: 2)
           MAX_REUSE = 2            # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
           SAME_IOU = 0.85          # nguong giong nhau cua mat na chu sang
-          FAST_HALF_K = 1.25       # nua chieu cao dai OCR fast = text_height * K
+          FAST_HALF_K = 0.8        # nua chieu cao dai FAST = th * K (cu 1.25 -> dai qua cao)
+          FAST_STRIP_MAX_RATIO = 0.22   # dai FAST cao hon ty le nay cua video -> coi la do hong, tat FAST
+          FAST_MIN_SCORE = 0.70    # FAST: diem toi thieu de giu ket qua (cu 0.50)
           BLUR_H_K = 1.5           # chieu cao vung blur = text_height * K
-          CHANGE_TOL_K = 0.35      # 2 neo lech y > max(8, K*chieu cao chu) => coi la DOI vi tri
+          TH_MAX_RATIO = 0.12      # chieu cao chu > ty le nay cua video -> bo neo (do hong)
+          CHANGE_TOL_K = 0.8       # lech y > max(10, K*th) moi coi la doi vi tri (cu 0.35)
+          CHANGE_MIN_ANCHORS = 2   # can >= N neo lien tiep cung lech moi tach doan
           REFINE_MIN_GAP = 1.5     # dung do nhi phan khi khoang < N giay
           REFINE_MAX_IT = 7        # so vong do nhi phan toi da cho moi diem doi
           SEG_PAD = 1.0            # moi doan OCR rong them +-N giay quanh ranh gioi
+          MERGE_GAP = 1.0          # gop 2 cue gan nhau (giay) neu chu gan giong
+          MERGE_SIM = 0.50         # nguong giong khi gop cue (chu >= 6 ky tu)
           def log(msg):
               print(msg, flush=True)
           def make_engine():
@@ -243,6 +246,8 @@ jobs:
               return cv2.countNonZero(cv2.Canny(gray, 80, 180)) >= need
           def norm_text(t):
               return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
+          def cjk_count(t):
+              return sum("\u4e00" <= ch <= "\u9fff" for ch in t)
           def run_ocr(engine, crop, x_off, y_off, frame_no):
               dets = []
               result, _ = engine(crop)
@@ -250,8 +255,7 @@ jobs:
                   return dets
               for box, text, score in result:
                   text = re.sub(r"\s+", "", text)
-                  cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
-                  if cjk < 2 or float(score) < .40:
+                  if cjk_count(text) < 2 or float(score) < .40:
                       continue
                   xs = [float(p[0]) + x_off for p in box]
                   ys = [float(p[1]) + y_off for p in box]
@@ -319,7 +323,7 @@ jobs:
                   t = norm_text(d["text"])
                   near = any(abs(d["cy"] - c) < 20 for _, _, c in sb)
                   if near:
-                      # ban OCR sai cua watermark (vd "动喵动", "动哺动漫") cung vi tri
+                      # ban OCR sai cua watermark cung vi tri
                       similar = bool(t) and any(t in s or s in t or SequenceMatcher(None, t, s).ratio() >= .5
                                                 for s in static_txt)
                       inside = any(d["x1"] >= a - 30 and d["x2"] <= b + 30 and abs(d["cy"] - c) < 20
@@ -331,8 +335,9 @@ jobs:
                   log(f"[STATIC] loai {len(dets) - len(keep)}/{len(dets)} detection (watermark)")
               return keep
           def pick_band(dets, height, min_frames=3):
-              """Gom box theo vi tri doc, tra ve dai on dinh nhat + tolerance."""
-              tolerance = max(18.0, height * .065)
+              """Gom box theo vi tri doc, tra ve dai on dinh nhat + tolerance.
+              Dung sai chat hon (3% chieu cao video) de 2 dong khac nhau khong bi gop."""
+              tolerance = max(14.0, height * .03)
               bands = []
               for d in sorted(dets, key=lambda v: v["cy"]):
                   choices = [(abs(float(np.median([x["cy"] for x in band])) - d["cy"]), band)
@@ -387,19 +392,19 @@ jobs:
                       dets.append(d)
               return dets
           def build_anchor(win, band, height):
-              """Tu cac box cua dai trong 1 cua so -> (cy, th) theo hop (union) tung frame."""
+              """Tu cac box cua dai trong 1 cua so -> (cy, th).
+              th = TRUNG VI chieu cao TUNG BOX (khong union nhieu box/dong -> khong phinh to)."""
               by = {}
               for d in band:
                   by.setdefault(d["frame"], []).append(d)
               cys, hs = [], []
               for items in by.values():
-                  y1 = min(d["y1"] for d in items)
-                  y2 = max(d["y2"] for d in items)
-                  cys.append((y1 + y2) / 2.0)
-                  hs.append(y2 - y1)
+                  for d in items:
+                      hs.append(d["y2"] - d["y1"])
+                  cys.append(float(np.median([d["cy"] for d in items])))
               cy = float(np.median(cys))
-              th = float(np.percentile(hs, 90))
-              ok = (th >= max(8, height * .012) and th <= height * .12
+              th = float(np.median(hs))
+              ok = (th >= max(8, height * .012) and th <= height * TH_MAX_RATIO
                     and height * .35 <= cy <= height * .98)
               if not ok:
                   return None
@@ -408,36 +413,44 @@ jobs:
                       "t_first": float(min(times)), "t_last": float(max(times)),
                       "t_mid": float(np.median(times))}
           def anchor_strip(cy_lo, cy_hi, th, y0, height):
-              ty0 = max(y0, int(cy_lo - th * FAST_HALF_K))
-              ty1 = min(height, int(math.ceil(cy_hi + th * FAST_HALF_K)))
+              half = th * FAST_HALF_K
+              ty0 = max(y0, int(cy_lo - half))
+              ty1 = min(height, int(math.ceil(cy_hi + half)))
               return ty0, ty1
-          def fast_check(anchors, width, height, x0, x1, y0):
-              """Tu kiem tra che do nhanh tren cac neo that: rec-only co khop det+rec khong."""
+          def fast_check(seg, width, height, x0, x1, y0, duration, st):
+              """Tu kiem tra FAST tren doan CHINH: so rec-only voi det+rec tren cung 1 dai khit.
+              Lay mau ngau nhien ca frame KHONG co sub de do ti le rac (rec-only doc ra chu khi det khong thay)."""
               engine = make_engine()
-              cands = []
-              for a in anchors:
-                  ty0, ty1 = anchor_strip(a["cy"], a["cy"], a["th"], y0, height)
-                  for sid, items in a["by"].items():
-                      ref = norm_text("".join(d["text"] for d in sorted(items, key=lambda d: d["x1"])))
-                      if len(ref) >= 2 and ty1 - ty0 >= 8:
-                          cands.append((items[0]["time"], ref, ty0, ty1))
-              if len(cands) > 60:
-                  stride = len(cands) / 60.0
-                  cands = [cands[int(i * stride)] for i in range(60)]
-              sims = []
-              for t, ref, ty0, ty1 in cands:
+              ty0, ty1 = seg["ty0"], seg["ty1"]
+              n = 80
+              rng = random.Random(12345)
+              pos, neg, junk = [], 0, 0
+              for i in range(n):
+                  t = duration * (i + rng.random()) / n
                   image = grab_frame(t, width, height)
                   if image is None:
                       continue
-                  line = image[ty0:ty1, x0:x1]
-                  if line.shape[0] < 8:
+                  strip = image[ty0:ty1, x0:x1]
+                  if strip.shape[0] < 8:
                       continue
-                  txt, _ = rec_only(engine, line)
-                  sims.append(SequenceMatcher(None, ref, norm_text(txt)).ratio())
-              mean = float(np.mean(sims)) if sims else 0.0
-              ok = len(sims) >= 8 and mean >= 0.7
-              log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh {mean:.2f} -> "
-                  f"{'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
+                  gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+                  if not has_text_edges(gray):
+                      continue
+                  dets = apply_static(run_ocr(engine, strip, x0, ty0, 0), st)
+                  ref = norm_text("".join(d["text"] for d in sorted(dets, key=lambda d: d["x1"])))
+                  txt, sc = rec_only(engine, strip)
+                  rec_ok = cjk_count(txt) >= 2 and sc >= FAST_MIN_SCORE
+                  if len(ref) >= 2:
+                      pos.append(SequenceMatcher(None, ref, norm_text(txt) if rec_ok else "").ratio())
+                  else:
+                      neg += 1
+                      if rec_ok:
+                          junk += 1
+              mean = float(np.mean(pos)) if pos else 0.0
+              junk_rate = junk / float(max(1, neg))
+              ok = len(pos) >= 8 and mean >= 0.75 and junk_rate <= 0.20
+              log(f"[FAST-CHECK] co sub: {len(pos)} mau, khop TB {mean:.2f} | khong sub: {neg} mau, rac {junk} "
+                  f"({junk_rate * 100:.0f}%) -> {'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
               return ok
           # ------------------------------------------------------------
           # DO NHI PHAN DIEM DOI VI TRI GIUA 2 NEO
@@ -464,6 +477,8 @@ jobs:
                   return None
               return "a" if na >= nb else "b"
           def refine(engine, ctx, t_a, t_b, cy_a, cy_b, th, st):
+              """Tra ve (lo, hi): doan thoi gian chua diem doi. Neu hoi tu thi hi-lo nho;
+              neu that bai thi (lo, hi) van phu khoang khong chac chan -> 2 doan se chong lan."""
               lo, hi = t_a, t_b
               tolm = max(18.0, th * .9)
               offsets = [0, .5, -.5, 1, -1, 1.5, -1.5, 2.5, -2.5, 4, -4, 6, -6]
@@ -489,20 +504,45 @@ jobs:
                       break
                   if not got:
                       break
-              b = (lo + hi) / 2.0
-              log(f"[REFINE] {t_a:.1f}s..{t_b:.1f}s (y {cy_a:.0f} -> {cy_b:.0f}) => doi tai ~{b:.1f}s ({probes} probe)")
-              return b
+              state = "hoi tu" if hi - lo <= REFINE_MIN_GAP * 1.5 else "KHONG chac -> 2 doan chong lan"
+              log(f"[REFINE] {t_a:.1f}s..{t_b:.1f}s (y {cy_a:.0f} -> {cy_b:.0f}) => doi trong {lo:.1f}s..{hi:.1f}s "
+                  f"({probes} probe, {state})")
+              return lo, hi
           def group_anchors(real):
-              groups = []
+              """Mac dinh 1 nhom. Chi tach nhom khi >= CHANGE_MIN_ANCHORS neo lien tiep cung lech y.
+              Neo le loi bi bo. So voi TRUNG VI cua nhom (khong so voi neo dau)."""
+              groups, pending = [], []
               for a in real:
-                  if groups:
-                      g = groups[-1]
-                      tol = max(8.0, CHANGE_TOL_K * max(a["th"], g[0]["th"]))
-                      if abs(a["cy"] - g[0]["cy"]) <= tol:
-                          g.append(a)
+                  if not groups:
+                      groups.append([a])
+                      continue
+                  g = groups[-1]
+                  med = float(np.median([x["cy"] for x in g]))
+                  th_ref = max(a["th"], float(np.median([x["th"] for x in g])))
+                  tol = max(10.0, CHANGE_TOL_K * th_ref)
+                  if abs(a["cy"] - med) <= tol:
+                      pending = []
+                      g.append(a)
+                      continue
+                  if pending and abs(a["cy"] - float(np.median([x["cy"] for x in pending]))) <= tol:
+                      pending.append(a)
+                  else:
+                      pending = [a]
+                  if len(pending) >= CHANGE_MIN_ANCHORS:
+                      groups.append(pending)
+                      pending = []
+              big = [g for g in groups if len(g) >= CHANGE_MIN_ANCHORS]
+              groups = big or [max(groups, key=len)]
+              merged = []
+              for g in groups:
+                  if merged:
+                      pm = float(np.median([x["cy"] for x in merged[-1]]))
+                      pth = float(np.median([x["th"] for x in merged[-1] + g]))
+                      if abs(float(np.median([x["cy"] for x in g])) - pm) <= max(10.0, CHANGE_TOL_K * pth):
+                          merged[-1].extend(g)
                           continue
-                  groups.append([a])
-              return groups
+                  merged.append(g)
+              return merged
           def make_blur(seg, width, height):
               th = seg["height"]
               bh = max(24, int(math.ceil(th * BLUR_H_K / 2.0) * 2))
@@ -575,7 +615,8 @@ jobs:
               log(f"[worker seg{seg}@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
               return dets
           def worker_fast(task):
-              """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu."""
+              """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu.
+              Loc diem >= FAST_MIN_SCORE; dung lai ket qua khi chu khong doi de on dinh van ban."""
               seg, start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
@@ -588,6 +629,7 @@ jobs:
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
               dets, k, calls = [], 0, 0
+              last, last_mask, reuse = None, None, 0
               t_w = time.time()
               while True:
                   buf = proc.stdout.read(size)
@@ -601,16 +643,29 @@ jobs:
                   frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
+                      last, last_mask, reuse = None, None, 0
                       continue
+                  small = cv2.resize(gray, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
+                  mask = small >= 200
+                  cnt = int(mask.sum())
+                  usable = 20 <= cnt <= mask.size * 0.3
+                  if usable and last is not None and last_mask is not None and reuse < MAX_REUSE:
+                      union = int(np.logical_or(mask, last_mask).sum())
+                      inter = int(np.logical_and(mask, last_mask).sum())
+                      if union and inter / union >= SAME_IOU:
+                          reuse += 1
+                          dets.append(dict(last, frame=fn, time=fn * STEP))
+                          continue
                   text, score = rec_only(engine, frame)
                   calls += 1
-                  cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
-                  if cjk < 2 or score < .50:
-                      continue
-                  # Khong co box that: dung cy/chieu cao cua doan
-                  dets.append({"frame": fn, "time": fn * STEP, "text": text, "score": score,
-                               "x1": float(x0), "x2": float(x1),
-                               "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy, "seg": seg})
+                  cur = None
+                  if cjk_count(text) >= 2 and score >= FAST_MIN_SCORE:
+                      # Khong co box that: dung cy/chieu cao cua doan
+                      cur = {"frame": fn, "time": fn * STEP, "text": text, "score": score,
+                             "x1": float(x0), "x2": float(x1),
+                             "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy, "seg": seg}
+                      dets.append(cur)
+                  last, last_mask, reuse = cur, mask, 0
               proc.stdout.close()
               proc.wait()
               log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
@@ -626,6 +681,36 @@ jobs:
               if gh:
                   with open(gh, "a", encoding="utf-8") as f:
                       f.write(f"needs_review={'true' if needs_review else 'false'}\n")
+          def comparable(a, b):
+              """Gop frame lien tiep (dung trong cung 1 cue)."""
+              a, b = norm_text(a), norm_text(b)
+              return bool(a and b and (a in b or b in a or SequenceMatcher(None, a, b).ratio() >= .68))
+          def similar_cues(a, b):
+              """Gop cue gan nhau: chu doc nhieu (nhieu loan) cua cung 1 cau."""
+              a, b = norm_text(a), norm_text(b)
+              if not a or not b:
+                  return False
+              if min(len(a), len(b)) >= 3 and (a in b or b in a):
+                  return True
+              need = MERGE_SIM if min(len(a), len(b)) >= 6 else 0.75
+              return SequenceMatcher(None, a, b).ratio() >= need
+          def best_variant(variants):
+              return max(variants, key=lambda k: (variants[k], len(k)))
+          def merge_cues(cues):
+              merged = []
+              for c in cues:
+                  if merged:
+                      m = merged[-1]
+                      if c["first"] - m["last"] <= MERGE_GAP and similar_cues(m["text"], c["text"]):
+                          m["last"] = max(m["last"], c["last"])
+                          m["frames"] += c["frames"]
+                          m["scores"].extend(c["scores"])
+                          for k, v in c["variants"].items():
+                              m["variants"][k] = m["variants"].get(k, 0.0) + v
+                          m["text"] = best_variant(m["variants"])
+                          continue
+                  merged.append(c)
+              return merged
           def main():
               OUT.mkdir(parents=True, exist_ok=True)
               t_start = time.time()
@@ -678,12 +763,19 @@ jobs:
               for d in dets_all:
                   by_win.setdefault(d["win"], []).append(d)
               anchors = [None] * n_win
+              rejected = 0
               for w, ds in by_win.items():
                   band, _ = pick_band(ds, height, MIN_WIN_FRAMES)
                   if band:
                       anchors[w] = build_anchor(w, band, height)
+                      if anchors[w] is None:
+                          rejected += 1
               real = [a for a in anchors if a]
-              log(f"[ANCHOR] {len(real)}/{n_win} cua so co neo sub")
+              log(f"[ANCHOR] {len(real)}/{n_win} cua so co neo sub ({rejected} neo bi bo vi chieu cao/vi tri bat thuong)")
+              if real:
+                  ths = [a["th"] for a in real]
+                  log(f"[ANCHOR] th (chieu cao 1 dong chu): trung vi={np.median(ths):.0f}px "
+                      f"min={min(ths):.0f} max={max(ths):.0f}")
               with (OUT / "anchors.tsv").open("w", encoding="utf-8") as f:
                   f.write("win\tt_first\tt_last\tcy\tth\tframes\n")
                   for a in real:
@@ -692,40 +784,50 @@ jobs:
               if not real:
                   write_invalid("khong tim thay neo sub nao")
                   return
-              # ---------- 1c: tu kiem tra che do nhanh (1 lan cho ca video) ----------
-              fast = False
-              if os.environ.get("OCR_FAST", "1") == "1":
-                  fast = fast_check(real, width, height, x0, x1, y0)
-              # ---------- 1d: gom neo thanh cac doan + do nhi phan diem doi ----------
+              # ---------- 1c: gom neo thanh cac doan + do nhi phan diem doi ----------
               groups = group_anchors(real)
               segs = []
               for g in groups:
                   cys = [a["cy"] for a in g]
                   segs.append({"center_y": float(np.median(cys)), "cy_lo": float(min(cys)),
-                               "cy_hi": float(max(cys)), "height": float(max(a["th"] for a in g)),
+                               "cy_hi": float(max(cys)),
+                               "height": float(np.median([a["th"] for a in g])),
                                "t_start": 0.0, "t_end": duration, "anchors": len(g)})
               log(f"[SEGMENT] {len(real)} neo -> {len(segs)} doan vi tri")
               if len(segs) > 1:
                   engine = make_engine()
                   for i in range(len(groups) - 1):
                       a, b = groups[i][-1], groups[i + 1][0]
-                      bnd = refine(engine, ctx, a["t_last"], b["t_first"],
-                                   segs[i]["center_y"], segs[i + 1]["center_y"],
-                                   max(segs[i]["height"], segs[i + 1]["height"]), static_info)
-                      segs[i]["t_end"] = bnd
-                      segs[i + 1]["t_start"] = bnd
-              tolerance = max(18.0, height * .065)
+                      lo, hi = refine(engine, ctx, a["t_last"], b["t_first"],
+                                      segs[i]["center_y"], segs[i + 1]["center_y"],
+                                      max(segs[i]["height"], segs[i + 1]["height"]), static_info)
+                      # chong lan tren khoang khong chac chan: moi doan phu den het khoang do
+                      segs[i]["t_end"] = hi
+                      segs[i + 1]["t_start"] = lo
+              tolerance = max(14.0, height * .03)
+              strips_ok = True
               for s in segs:
                   s["ty0"], s["ty1"] = anchor_strip(s["cy_lo"], s["cy_hi"], s["height"], y0, height)
                   half = max(s["height"] * 1.6, tolerance * 1.1)
                   s["sy0"] = max(y0, int(s["cy_lo"] - half))
                   s["sy1"] = min(height, int(math.ceil(s["cy_hi"] + half)))
                   s["blur"] = make_blur(s, width, height)
-                  if s["ty1"] - s["ty0"] < 16 or s["sy1"] - s["sy0"] < 16:
-                      fast = False
+                  fh = s["ty1"] - s["ty0"]
+                  if fh < 16 or s["sy1"] - s["sy0"] < 16 or fh > height * FAST_STRIP_MAX_RATIO:
+                      strips_ok = False
               for i, s in enumerate(segs):
                   log(f"[SEGMENT {i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']:.0f} "
-                      f"({s['cy_lo']:.0f}..{s['cy_hi']:.0f}) th={s['height']:.0f} | blur y={s['blur']['y']} h={s['blur']['height']}")
+                      f"({s['cy_lo']:.0f}..{s['cy_hi']:.0f}) th={s['height']:.0f} | "
+                      f"fast_strip y={s['ty0']}..{s['ty1']} ({s['ty1'] - s['ty0']}px) | "
+                      f"blur y={s['blur']['y']} h={s['blur']['height']}")
+              # ---------- 1d: tu kiem tra FAST (1 lan, tren doan chinh) ----------
+              fast = False
+              if os.environ.get("OCR_FAST", "1") == "1":
+                  if not strips_ok:
+                      log("[FAST-CHECK] dai FAST bat thuong (qua cao/thap) -> tat FAST, dung det+rec")
+                  else:
+                      main_seg = max(segs, key=lambda s: s["anchors"])
+                      fast = fast_check(main_seg, width, height, x0, x1, y0, duration, static_info)
               log(f"[ANCHOR] giai doan 1 xong sau {time.time() - t_start:.0f}s")
               # ---------- GIAI DOAN 2: OCR toan video theo doan ----------
               total_frames = int(duration * FPS)
@@ -765,7 +867,7 @@ jobs:
               filtered = []
               for d in detections:
                   s = segs[d["seg"]]
-                  m = max(12.0, .8 * s["height"])
+                  m = max(12.0, 1.0 * s["height"])
                   if s["cy_lo"] - m <= d["cy"] <= s["cy_hi"] + m:
                       filtered.append(d)
               by_frame = {}
@@ -779,31 +881,44 @@ jobs:
                   line = "".join(d["text"] for d in best)
                   if line:
                       frame_lines.append((fn * step, line, max(d["score"] for d in best), fn))
-              def comparable(a, b):
-                  a = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", a)
-                  b = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", b)
-                  return bool(a and b and (a in b or b in a or SequenceMatcher(None, a, b).ratio() >= .68))
+              # ---------- Gom frame lien tiep -> cue ----------
               cues = []
               for t, text, score, fn in frame_lines:
                   if cues and t - cues[-1]["last"] <= step * 1.51 and comparable(cues[-1]["text"], text):
-                      seg = cues[-1]
-                      seg["last"] = t
-                      seg["frames"] += 1
-                      seg["scores"].append(score)
-                      seg["variants"][text] = seg["variants"].get(text, 0) + 1
-                      seg["text"] = max(seg["variants"], key=seg["variants"].get)
+                      c = cues[-1]
+                      c["last"] = t
+                      c["frames"] += 1
+                      c["scores"].append(score)
+                      c["variants"][text] = c["variants"].get(text, 0.0) + score
+                      c["text"] = best_variant(c["variants"])
                   else:
                       cues.append({"text": text, "first": t, "last": t, "frames": 1,
-                                   "scores": [score], "variants": {text: 1}})
-              cues = [x for x in cues if x["frames"] >= 2 or
-                      (sum("\u4e00" <= ch <= "\u9fff" for ch in x["text"]) >= 2 and max(x["scores"]) >= .55)]
+                                   "scores": [score], "variants": {text: score}})
+              n_before = len(cues)
+              # ---------- Gop cue gan nhau co chu gan giong (chong trung lap do nhieu OCR) ----------
+              cues = merge_cues(cues)
+              n_merged = len(cues)
+              # ---------- Loc rac ----------
+              def keep_cue(x):
+                  if cjk_count(x["text"]) < 2:
+                      return False
+                  mean = sum(x["scores"]) / len(x["scores"])
+                  if x["frames"] >= 2:
+                      return True
+                  return max(x["scores"]) >= .65 and mean >= .75
+              cues = [x for x in cues if keep_cue(x)]
+              log(f"[CUE] {n_before} cue tho -> {n_merged} sau gop cue gan nhau -> {len(cues)} sau loc rac")
               srt = OUT / "hardsub-3fps.srt"
               with srt.open("w", encoding="utf-8") as f:
-                  for i, seg in enumerate(cues, 1):
-                      start = max(0, seg["first"] - step / 2)
+                  prev_end = 0.0
+                  idx = 0
+                  for seg in cues:
+                      start = max(prev_end, max(0, seg["first"] - step / 2))
                       end = min(duration, seg["last"] + step / 2)
                       if end > start:
-                          f.write(f"{i}\n{stamp(start)} --> {stamp(end)}\n{seg['text']}\n\n")
+                          idx += 1
+                          f.write(f"{idx}\n{stamp(start)} --> {stamp(end)}\n{seg['text']}\n\n")
+                          prev_end = end
               review_rows = []
               for seg in cues:
                   mean = sum(seg["scores"]) / len(seg["scores"])
@@ -839,7 +954,7 @@ jobs:
                   for i, s in enumerate(geometry["segments"]):
                       f.write(f"{i}\t{s['t_start']}\t{s['t_end']}\t{s['center_y']}\t{s['cy_lo']}\t"
                               f"{s['cy_hi']}\t{s['height']}\t{s['blur']['y']}\t{s['blur']['height']}\n")
-              # Anh kiem tra: box OCR cua 1 neo giua video (xanh) + vung blur cua doan do (do)
+              # Anh kiem tra: box OCR cua 1 neo giua video (xanh) + vung blur (do) + dai FAST (vang)
               try:
                   a = real[len(real) // 2]
                   seg_i = max(0, min(len(segs) - 1, next(
@@ -853,6 +968,7 @@ jobs:
                       bl = segs[seg_i]["blur"]
                       cv2.rectangle(image, (bl["x"], bl["y"]),
                                     (bl["x"] + bl["width"], bl["y"] + bl["height"]), (0, 0, 255), 3)
+                      cv2.rectangle(image, (x0, segs[seg_i]["ty0"]), (x1, segs[seg_i]["ty1"]), (0, 255, 255), 2)
                       cv2.imwrite("work/subtitle-geometry-preview.jpg", image)
               except Exception as e:
                   log(f"[PREVIEW] bo qua: {e!r}")
@@ -888,7 +1004,7 @@ jobs:
               sys.exit(1)
           print(f"Geometry OK: {len(segs)} đoạn vị trí sub, {g.get('anchors')} điểm neo / {g.get('windows')} cửa sổ, fast={g.get('fast_ocr')}")
           for i, s in enumerate(segs[:30]):
-              print(f"  [{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']} | blur y={s['blur']['y']} h={s['blur']['height']}")
+              print(f"  [{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']} h={s['height']} | blur y={s['blur']['y']} h={s['blur']['height']}")
           PY
       - name: Create static overlay detection script
         run: |
@@ -1139,16 +1255,21 @@ jobs:
           set -euo pipefail
           python3 static_detect.py
           cat work/static_regions.json
+      # ============================================================
+      # DỊCH: dọn sub Trung (gộp trùng, bỏ rác) -> Gemini -> KHÔNG BAO GIỜ fallback tiếng Trung
+      #       Kết quả thô: work/vi_raw.json (CHƯA sạch, bước sau mới hoàn thiện)
+      # ============================================================
       - name: Create Translate script
         run: |
           cat > translate_native.py <<'PY'
           """
-          Doc sub goc cua Bilibili (work/native.srt, tieng Trung) -> dich sang tieng Viet
-          bang Gemini. KHONG ASR, KHONG render video. Ket qua cuoi cung la
-          work/vietnamese.vtt (input cho buoc TTS) cung voi cac file .srt de doi chieu.
-          Sau khi dich co them buoc RUT GON cac cau qua dai so voi thoi luong cue.
+          Doc sub goc (work/native.srt, tieng Trung) -> DON SACH sub Trung (gop cue trung/gan giong,
+          bo rac) -> dich sang tieng Viet bang Gemini -> rut gon cau qua dai.
+          Dong AI tra "..." (rac OCR khong doc duoc) = BO TRONG, KHONG BAO GIO giu lai tieng Trung.
+          Ket qua: work/vi_raw.json (start, end, text, vi). Buoc finalize_vi.py se lam sach hoan toan.
           """
-          import os, re, time, random
+          import os, re, time, random, json
+          from difflib import SequenceMatcher
           from pathlib import Path
           import pysubs2
           from google import genai
@@ -1156,11 +1277,12 @@ jobs:
           WORK = Path("work")
           NATIVE_SRT = WORK / "native.srt"
           MIN_CUE_DURATION = 0.10
-          # Batch chi sot 1..N dong thi BO QUA (de trong), khong goi API retry
-          MAX_SKIP_MISSING = 5
+          # Gop cue Trung gan giong nhau: khoang cach toi da (giay) va nguong giong
+          ZH_MERGE_GAP = 1.5
+          ZH_MERGE_SIM = 0.55
           # So tu tieng Viet toi da moi giay de TTS doc kip.
-          # TTS sinh o toc do 1.0x, buoc mix se tang toc toi da ~1.5x
           MAX_SYL_PER_SEC = 6.0
+          CJK_RE = re.compile(r"[\u2e80-\u2fdf\u3000-\u30ff\u3100-\u31ff\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
           # ---- GEMINI ----
           GEMINI_MODEL = "gemini-3.5-flash-lite"
           GEMINI_BATCH_SIZE = 150
@@ -1172,7 +1294,7 @@ jobs:
               "CRITICAL RULES:\n"
               "1. You MUST output EVERY line with its exact index. Never skip any index.\n"
               "2. Maintain the exact same line identifiers like [0], [1], [2], etc. Do not merge, skip, or group any lines.\n"
-              "3. If a line is empty or just '...', output the identifier with '...'.\n"
+              "3. If a line is empty, unreadable garbage, or just '...', output the identifier with '...'.\n"
               "4. Translate naturally based on the surrounding context of the whole video.\n"
               "5. Output ONLY the translated numbered lines. No markdown, no notes, no extra text.\n"
               "6. PRONOUN SAFETY (VERY IMPORTANT): The source is Chinese, where family/relationship terms "
@@ -1183,16 +1305,32 @@ jobs:
               "given line alone, DO NOT guess a specific relational pronoun. Instead, rephrase the sentence to be "
               "SHORTER and more NEUTRAL — using no pronoun, an implied subject, or a generic/neutral phrasing — "
               "so the sentence still sounds natural in Vietnamese without committing to an incorrect relationship.\n"
-              "8. The source subtitles come from automatic speech recognition and may contain small recognition "
-              "errors or homophone mistakes. Use the surrounding context to infer the intended meaning.\n"
+              "8. The source subtitles come from OCR of burned-in subtitles and may contain recognition errors, "
+              "wrong or missing characters and homophone mistakes. Use the surrounding context to infer the "
+              "intended meaning. If a line is so corrupted that you cannot recover a sensible meaning, output '...' for it.\n"
               "9. CONCISENESS (VERY IMPORTANT): Make every Vietnamese line SHORT, concise and easy to understand at a "
               "glance. Use simple, everyday spoken Vietnamese. Cut filler words, repeated phrases and unnecessary "
-              "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain."
+              "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain.\n"
+              "10. The output must be PURE VIETNAMESE. NEVER output Chinese characters, pinyin or any other language."
           )
           def log(msg):
               print(msg, flush=True)
+          def has_cjk(t):
+              return bool(CJK_RE.search(t or ""))
+          def cjk_n(t):
+              return sum("\u4e00" <= ch <= "\u9fff" for ch in t)
+          def norm_zh(t):
+              return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
+          def similar_zh(a, b):
+              a, b = norm_zh(a), norm_zh(b)
+              if not a or not b:
+                  return False
+              if min(len(a), len(b)) >= 3 and (a in b or b in a):
+                  return True
+              need = ZH_MERGE_SIM if min(len(a), len(b)) >= 6 else 0.75
+              return SequenceMatcher(None, a, b).ratio() >= need
           # ============================================================
-          # DOC SUB GOC -> CUE TIENG TRUNG
+          # DOC SUB GOC -> CUE TIENG TRUNG -> DON SACH
           # ============================================================
           def clean_text(raw):
               t = raw.replace("\\N", " ").replace("\\n", " ").replace("\n", " ")
@@ -1225,10 +1363,30 @@ jobs:
                   if en - st < MIN_CUE_DURATION:
                       continue
                   final.append({"start": st, "end": en, "text": c["text"]})
-              log(f"CHINESE CUES (native sub) = {len(final)}")
+              log(f"CHINESE CUES (native sub, tho) = {len(final)}")
               if not final:
                   raise RuntimeError("Sub goc khong co cue nao hop le.")
               return final
+          def clean_zh_cues(cues):
+              """Bo cue khong co chu Han, gop cue gan nhau co chu gan giong (nhieu OCR cua cung 1 cau)."""
+              kept = [c for c in cues if cjk_n(c["text"]) >= 2]
+              dropped = len(cues) - len(kept)
+              out, merged = [], 0
+              for c in kept:
+                  if out:
+                      p = out[-1]
+                      if c["start"] - p["end"] <= ZH_MERGE_GAP and similar_zh(p["text"], c["text"]):
+                          p["end"] = max(p["end"], c["end"])
+                          # giu ban DAI hon (ban ngan thuong la doc thieu chu)
+                          if len(norm_zh(c["text"])) > len(norm_zh(p["text"])) * 1.15:
+                              p["text"] = c["text"]
+                          merged += 1
+                          continue
+                  out.append(dict(c))
+              log(f"CLEAN ZH: bo {dropped} cue khong co chu Han, gop {merged} cue trung/gan giong -> con {len(out)} cue")
+              if not out:
+                  raise RuntimeError("Sau khi don sach khong con cue nao.")
+              return out
           # ============================================================
           # DICH
           # ============================================================
@@ -1288,10 +1446,10 @@ jobs:
                           pass
               return pairs
           def parse_batch(response_text, n):
-              """Ghep theo SO THU TU AI ghi. Dong sot -> de trong, KHONG bao gio day lech cac dong sau."""
+              """Ghep theo SO THU TU AI ghi. Dong sot -> KHONG co trong dict (de retry), khong day lech dong sau.
+              Dong AI chu dong tra '...' -> co trong dict voi gia tri '' (= bo trong, KHONG retry)."""
               pairs = parse_pairs(response_text)
               out = {}
-              # Truong hop AI danh so sai hang loat (vd deu +100) nhung du so dong -> ghep theo vi tri
               in_range = sum(1 for i, _ in pairs if 0 <= i < n)
               if len(pairs) == n and in_range < n * 0.5:
                   log(">> SUA SO THU TU: AI ghi sai so hang loat, ghep theo vi tri")
@@ -1302,10 +1460,9 @@ jobs:
               for k, (i, val) in enumerate(pairs):
                   nxt_i = pairs[k + 1][0] if k + 1 < len(pairs) else None
                   if prev < i < n:
-                      idx = i                                   # so hop le -> TIN so AI ghi
+                      idx = i
                   else:
                       expected = prev + 1
-                      # chi sua so ghi nham khi dong KE TIEP xac nhan dung 1 khe nay
                       if expected < n and expected not in out and (nxt_i is None or nxt_i == expected + 1):
                           log(f">> SUA SO THU TU: AI ghi [{i}], dat vao [{expected}]")
                           idx = expected
@@ -1322,6 +1479,7 @@ jobs:
               total_batches = (total + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
               log(f"BAT DAU DICH - {total} dong / {total_batches} batch")
               results = []
+              n_blank = 0
               for i in range(0, total, GEMINI_BATCH_SIZE):
                   batch = cues[i:i + GEMINI_BATCH_SIZE]
                   bn = i // GEMINI_BATCH_SIZE + 1
@@ -1337,40 +1495,34 @@ jobs:
                   for line in response_text.strip().split("\n"):
                       log(f"   {line}")
                   translated = parse_batch(response_text, len(batch))
-                  missing = [idx for idx in range(len(batch)) if not translated.get(idx)]
-                  skip_blank = 0 < len(missing) <= MAX_SKIP_MISSING
-                  if skip_blank:
-                      log(f">> AI bo sot {len(missing)} dong: {missing}. "
-                          f"<= {MAX_SKIP_MISSING} nen BO QUA, de trong, khong retry.")
-                  elif missing:
-                      log(f">> CANH BAO: AI bo sot {len(missing)} dong: {missing}. Retry...")
-                      rp = "You missed some lines in your previous translation. Please translate ONLY these missing lines:\n\n"
-                      rp += "".join(f"[{idx}] {batch[idx]['text'].strip() or '...'}\n" for idx in missing)
-                      rp += "\nOutput ONLY the missing lines with their exact [index] prefix."
+                  # Chi retry dong AI THAT SU bo sot (khong co trong ket qua) hoac van con chu Han.
+                  # Dong AI tra "..." la quyet dinh bo trong -> KHONG retry.
+                  redo = [idx for idx in range(len(batch))
+                          if idx not in translated or has_cjk(translated.get(idx, ""))]
+                  if redo:
+                      log(f">> Retry {len(redo)} dong bi sot/con chu Han: {redo}")
+                      rp = "Translate ONLY these lines into pure Vietnamese (no Chinese characters). Use '...' if unreadable:\n\n"
+                      rp += "".join(f"[{idx}] {batch[idx]['text'].strip() or '...'}\n" for idx in redo)
+                      rp += "\nOutput ONLY these lines with their exact [index] prefix."
                       rr = call_gemini_with_retry(rp)
                       if rr:
                           log(">> KET QUA RETRY:")
                           for line in rr.strip().split("\n"):
                               log(f"   {line}")
-                          retry_map = parse_translated(rr)
-                          translated.update({k: v for k, v in retry_map.items() if k in missing})
-                  fallback = 0
+                          for k, v in parse_translated(rr).items():
+                              if k in redo and not has_cjk(v):
+                                  translated[k] = v
                   for idx, cue in enumerate(batch):
-                      if translated.get(idx):
-                          vi = translated[idx]
-                      elif skip_blank:
+                      vi = translated.get(idx, "")
+                      if not vi.strip():
                           vi = ""
-                          log(f"   [{i + idx + 1:04d}] BO TRONG (AI sot): {cue['text']!r}")
-                      else:
-                          vi = cue["text"]
-                          fallback += 1
-                          log(f"   [{i + idx + 1:04d}] FALLBACK (giu nguyen goc): {cue['text']!r}")
+                          n_blank += 1
+                          log(f"   [{i + idx + 1:04d}] BO TRONG: {cue['text']!r}")
                       results.append({"start": cue["start"], "end": cue["end"],
                                       "text": cue["text"], "vi": vi})
-                  if fallback:
-                      log(f">> Batch {bn}: {fallback} dong giu nguyen tieng Trung.")
                   log(f"[BATCH {bn}/{total_batches}] Hoan thanh")
                   time.sleep(3)
+              log(f">> Tong cong {n_blank}/{total} dong bo trong (rac OCR / khong doc duoc)")
               return results
           # ============================================================
           # RUT GON CAU QUA DAI (de TTS doc kip trong thoi luong cue)
@@ -1398,7 +1550,7 @@ jobs:
                           "Keep the core meaning, keep the same speaker relationship and pronouns (or drop pronouns if unsure), "
                           "keep it natural and fluent, and drop filler words. Each line is formatted as [index|max_words] text. "
                           "Your output for each line MUST be at most max_words words. "
-                          "Output ONLY '[index] shortened text' lines. Do NOT output the max_words number.\n\n"
+                          "Output ONLY '[index] shortened text' lines. Do NOT output the max_words number. Pure Vietnamese only.\n\n"
                           + "".join(f"[{i}|{lim}] {results[i]['vi']}\n" for i, lim in part)
                       )
                       resp = call_gemini_with_retry(prompt)
@@ -1409,7 +1561,7 @@ jobs:
                           log(f"   {line}")
                       allowed = {i for i, _ in part}
                       for i, txt in parse_translated(resp).items():
-                          if i in allowed and txt:
+                          if i in allowed and txt and not has_cjk(txt):
                               results[i]["vi"] = txt
                       time.sleep(2)
               return results
@@ -1417,51 +1569,192 @@ jobs:
               with open(WORK / "translation_debug.txt", "w", encoding="utf-8") as f:
                   for idx, r in enumerate(results):
                       zh, vi = len(r["text"]), len(r["vi"])
-                      flag = " [SUSPICIOUS]" if vi < zh * 0.6 else ""
                       dur = r["end"] - r["start"]
-                      f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s ({dur:.2f}s){flag}\n")
+                      f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s ({dur:.2f}s)\n")
                       f.write(f"  ZH ({zh}): {r['text']}\n")
                       f.write(f"  VI ({vi}, {count_syl(r['vi'])} tu): {r['vi']}\n\n")
-          # ============================================================
-          # LUU FILE SUB (SRT + VTT)
-          # ============================================================
-          def save_sub(cues, path, field, skip_empty=False):
-              subs = pysubs2.SSAFile()
-              for c in cues:
-                  if skip_empty and not c[field].strip():
-                      continue
-                  subs.events.append(pysubs2.SSAEvent(
-                      start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=c[field]))
-              subs.save(str(path), encoding="utf-8")
           def main():
               cues = load_native_cues()
-              save_sub(cues, WORK / "chinese.srt", "text")
+              cues = clean_zh_cues(cues)
+              subs = pysubs2.SSAFile()
+              for c in cues:
+                  subs.events.append(pysubs2.SSAEvent(start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=c["text"]))
+              subs.save(str(WORK / "chinese.srt"), encoding="utf-8")
               for i, c in enumerate(cues, 1):
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
               translated = translate_cues(cues)
               translated = shorten_long(translated)
               write_debug(translated)
-              save_sub(translated, WORK / "vietnamese.srt", "vi", skip_empty=True)
-              save_sub(translated, WORK / "vietnamese.vtt", "vi", skip_empty=True)
-              log("NATIVE SUB + TRANSLATE COMPLETE")
-              log(f"Chinese SRT   : {WORK / 'chinese.srt'}")
-              log(f"Vietnamese SRT: {WORK / 'vietnamese.srt'}")
-              log(f"Vietnamese VTT: {WORK / 'vietnamese.vtt'} (dung cho buoc TTS)")
+              (WORK / "vi_raw.json").write_text(json.dumps(translated, ensure_ascii=False, indent=1), encoding="utf-8")
+              log("TRANSLATE COMPLETE -> work/vi_raw.json (chua hoan thien, chay finalize_vi.py)")
           if __name__ == "__main__":
               main()
           PY
-      - name: Run Translate (native sub → Vietnamese)
+      - name: Run Translate (native sub → Vietnamese raw)
         env:
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
         run: |
           set -euo pipefail
           python translate_native.py
-      - name: Check Translate output
+      # ============================================================
+      # HOÀN THIỆN SUB VIỆT (TRƯỚC KHI TTS): sạch ký tự Trung/rác, bỏ dòng trống,
+      # gộp/loại câu trùng gần nhau, chỉnh thời gian, KIỂM TRA CỨNG rồi mới ghi vietnamese.vtt/.srt
+      # ============================================================
+      - name: Create Finalize-Vietnamese script
+        run: |
+          cat > finalize_vi.py <<'PY'
+          """
+          work/vi_raw.json -> work/vietnamese.srt + work/vietnamese.vtt (SACH).
+          1) Chuan hoa: NFKC, bo tag/markdown, XOA moi ky tu Han/CJK/fullwidth. Dong co chu Han ma con lai < 3 tu -> bo.
+          2) Bo dong trong / chi co dau cau / khong co chu cai.
+          3) Gop cau TRUNG hoac GAN GIONG nhau trong cua so thoi gian ngan (dung/chua/sim >= 0.85), giu ban dai hon.
+          4) Sua thoi gian: sap xep, khong chong lan, end > start.
+          5) Kiem tra cung: khong CJK, khong cap lien ke trung lap, co it nhat vai cue. Loi -> exit 1.
+          """
+          import json, re, sys, unicodedata
+          from difflib import SequenceMatcher
+          from pathlib import Path
+          WORK = Path("work")
+          CJK_RE = re.compile(r"[\u2e80-\u2fdf\u3000-\u30ff\u3100-\u31ff\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
+          SHORT_WORDS = 4       # cau < 4 tu duoc coi la cau ngan
+          WIN_SHORT = 3.0       # cua so (giay) tim trung lap cho cau ngan
+          WIN_LONG = 8.0        # cua so (giay) cho cau dai
+          SIM_THRESHOLD = 0.85
+          CONTAIN_RATIO = 0.60
+          LOOKBACK = 3          # so cue truoc do de so sanh
+          MIN_FINAL_CUES = 1
+          def log(msg):
+              print(msg, flush=True)
+          def clean_vi(text):
+              t = unicodedata.normalize("NFKC", text or "")
+              t = re.sub(r"\{[^}]*\}", " ", t)
+              t = re.sub(r"<[^>]+>", " ", t)
+              t = re.sub(r"^\s*\[\d+(\|\d+)?\]\s*", "", t)
+              t = t.replace("、", ", ").replace("。", ". ")
+              had_cjk = bool(CJK_RE.search(t))
+              t = CJK_RE.sub(" ", t)
+              t = t.replace("…", "...")
+              t = re.sub(r"[\*_`#~^|\\<>]", " ", t)
+              t = re.sub(r"\.{2,}", ".", t)
+              t = re.sub(r"([,;:!?])\1+", r"\1", t)
+              t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+              t = re.sub(r"([,;:!?])(?=[^\s,;:!?.])", r"\1 ", t)
+              t = re.sub(r"\s+", " ", t).strip()
+              t = t.lstrip(" ,.;:!?-–—'\"")
+              t = t.rstrip(" ,;:-–—'\"")
+              t = unicodedata.normalize("NFC", t)
+              return t, had_cjk
+          def n_words(t):
+              return len(re.findall(r"\w+", t, re.UNICODE))
+          def has_letters(t):
+              return bool(re.search(r"[^\W\d_]", t, re.UNICODE))
+          def key_of(t):
+              k = re.sub(r"[\W_]+", " ", t.casefold(), flags=re.UNICODE)
+              return re.sub(r"\s+", " ", k).strip()
+          def is_dup(ka, kb):
+              if not ka or not kb:
+                  return False
+              if ka == kb:
+                  return True
+              short, long_ = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
+              if len(short.split()) >= 2 and short in long_ and len(short) / float(len(long_)) >= CONTAIN_RATIO:
+                  return True
+              return SequenceMatcher(None, ka, kb).ratio() >= SIM_THRESHOLD
+          def ts(sec, sep):
+              ms = max(0, int(round(sec * 1000)))
+              h, ms = divmod(ms, 3600000)
+              m, ms = divmod(ms, 60000)
+              s, ms = divmod(ms, 1000)
+              return f"{h:02}:{m:02}:{s:02}{sep}{ms:03}"
+          def main():
+              raw = json.loads((WORK / "vi_raw.json").read_text(encoding="utf-8"))
+              raw.sort(key=lambda r: (r["start"], r["end"]))
+              dropped = []
+              # ---- 1+2: lam sach, bo dong rong ----
+              cues = []
+              for r in raw:
+                  t, had_cjk = clean_vi(r.get("vi", ""))
+                  if not t or not has_letters(t):
+                      dropped.append((r["start"], "TRONG", r.get("text", ""), r.get("vi", "")))
+                      continue
+                  if had_cjk and n_words(t) < 3:
+                      dropped.append((r["start"], "CON_CHU_HAN", r.get("text", ""), r.get("vi", "")))
+                      continue
+                  cues.append({"start": float(r["start"]), "end": float(r["end"]), "text": t, "key": key_of(t)})
+              n_clean = len(cues)
+              # ---- 3: gop/loai cau trung gan nhau ----
+              out = []
+              for c in cues:
+                  hit, hit_pos = None, None
+                  for back, p in enumerate(reversed(out[-LOOKBACK:])):
+                      words = min(n_words(p["text"]), n_words(c["text"]))
+                      win = WIN_SHORT if words < SHORT_WORDS else WIN_LONG
+                      if c["start"] - p["end"] <= win and is_dup(p["key"], c["key"]):
+                          hit, hit_pos = p, back
+                          break
+                  if hit is None:
+                      out.append(c)
+                      continue
+                  # giu ban DAI hon
+                  if len(c["key"]) > len(hit["key"]):
+                      hit["text"], hit["key"] = c["text"], c["key"]
+                  # chi keo dai thoi gian khi trung voi cue NGAY TRUOC (tranh de len cue o giua)
+                  if hit_pos == 0:
+                      hit["end"] = max(hit["end"], c["end"])
+                  dropped.append((c["start"], "TRUNG", "", c["text"]))
+              n_dedup = len(out)
+              # ---- 4: thoi gian ----
+              out.sort(key=lambda c: (c["start"], c["end"]))
+              for i, c in enumerate(out):
+                  if i + 1 < len(out) and c["end"] > out[i + 1]["start"]:
+                      c["end"] = out[i + 1]["start"]
+                  if c["end"] <= c["start"]:
+                      c["end"] = c["start"] + 0.1
+              # ---- 5: kiem tra cung ----
+              errors = []
+              for i, c in enumerate(out):
+                  if CJK_RE.search(c["text"]):
+                      errors.append(f"cue {i} con ky tu Trung: {c['text']!r}")
+                  if i > 0:
+                      p = out[i - 1]
+                      words = min(n_words(p["text"]), n_words(c["text"]))
+                      win = WIN_SHORT if words < SHORT_WORDS else WIN_LONG
+                      if c["start"] - p["end"] <= win and is_dup(p["key"], c["key"]):
+                          errors.append(f"cue {i-1}/{i} trung lap: {p['text']!r} | {c['text']!r}")
+              if len(out) < MIN_FINAL_CUES:
+                  errors.append("khong con cue nao sau khi hoan thien")
+              with (WORK / "vi_dropped.txt").open("w", encoding="utf-8") as f:
+                  for st, why, zh, vi in dropped:
+                      f.write(f"{st:8.2f}s | {why:11s} | ZH={zh!r} | VI={vi!r}\n")
+              log(f"[FINALIZE] raw={len(raw)} -> sach={n_clean} -> sau loai trung={n_dedup} | "
+                  f"bo {len(dropped)} dong (chi tiet: work/vi_dropped.txt)")
+              if errors:
+                  for e in errors[:30]:
+                      print(f"::error::{e}")
+                  sys.exit(1)
+              with (WORK / "vietnamese.srt").open("w", encoding="utf-8") as f:
+                  for i, c in enumerate(out, 1):
+                      f.write(f"{i}\n{ts(c['start'], ',')} --> {ts(c['end'], ',')}\n{c['text']}\n\n")
+              with (WORK / "vietnamese.vtt").open("w", encoding="utf-8") as f:
+                  f.write("WEBVTT\n\n")
+                  for c in out:
+                      f.write(f"{ts(c['start'], '.')} --> {ts(c['end'], '.')}\n{c['text']}\n\n")
+              log(f"[FINALIZE] OK: {len(out)} cue sach -> work/vietnamese.srt / work/vietnamese.vtt")
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Finalize Vietnamese subtitles (clean + dedupe + validate)
+        run: |
+          set -euo pipefail
+          python3 finalize_vi.py
+      - name: Check final subtitle output
         run: |
           set -e
           echo "===== VIETNAMESE VTT (head) ====="
           head -40 work/vietnamese.vtt || true
           wc -l work/vietnamese.vtt || true
+          echo "===== DROPPED (head) ====="
+          head -30 work/vi_dropped.txt || true
       - name: TTS Generation (Revid TTS API + Vietnamese VTT)
         env:
           REVID_API_KEYS: ${{ secrets.REVID_API_KEYS }}   # mỗi dòng 1 key
@@ -1469,7 +1762,7 @@ jobs:
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"
           TTS_SPEEDUP: "1.0"
-          TTS_WORKERS: "15"             # thử lại 4 để so sánh tốc độ với workers=1
+          TTS_WORKERS: "15"
           TTS_MAX_RETRIES: "3"
           TTS_TIMEOUT: "200"           # timeout mỗi request (giây)
           TTS_HEARTBEAT: "30"          # cứ N giây in danh sách request đang chờ
@@ -1519,6 +1812,7 @@ jobs:
                   if items:
                       desc = " | ".join(f"c{i}: key#{ki + 1} lan{att} cho {now - t:.0f}s"
                                         for i, (ki, att, t) in items)
+                      log(f"[HEARTBEAT] dang cho: {desc}")
                   else:
                       log("[HEARTBEAT] khong co request nao dang cho")
           def pick_key(avoid=None):
@@ -1743,7 +2037,7 @@ jobs:
           TTS_COMP_MAKEUP = 2.0      # bù âm lượng sau bộ nén (2.0 ≈ +6dB)
           TTS_VOLUME = 1.0           # nhân thêm âm lượng cuối (1.0 = giữ nguyên)
           # ---- Mix / tốc độ ----
-          BG_RATIO = 0.2             # tiếng gốc khi CÓ thoại = 50% độ to TTS (muốn nhỏ hơn: 0.3, to hơn: 0.7)
+          BG_RATIO = 0.2             # tiếng gốc khi CÓ thoại (muốn nhỏ hơn: 0.1, to hơn: 0.4)
           BG_OUT = 0.8               # tiếng gốc khi KHÔNG có thoại (1.0 = giữ nguyên mức đã chuẩn hóa)
           BG_IN = BG_RATIO           # (envelope tối đa 1.0; phần khuếch đại nằm ở BG_GAIN bên dưới)
           BG_GAIN_MAX = 4.0          # giới hạn khuếch đại tối đa cho tiếng gốc
@@ -1796,7 +2090,7 @@ jobs:
                   return float(np.sqrt(np.mean(v ** 2))) if v.size > 1000 else 0.0
               except Exception:
                   return 0.0
-          
+
           bg_rms = measure_bg_rms()
           BG_GAIN = float(np.clip(TARGET_RMS / bg_rms, 0.5, BG_GAIN_MAX)) if bg_rms > 1e-4 else 1.0
           print(f"Original audio RMS={bg_rms:.3f} -> BG_GAIN={BG_GAIN:.2f}x "
@@ -1962,7 +2256,6 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
-
           rm -rf pack && mkdir -p pack
           cp raw_video.mp4                 pack/raw_video.mp4
           cp work/mixed_audio.m4a          pack/mixed_audio.m4a
@@ -1970,14 +2263,12 @@ jobs:
           cp work/vietnamese.vtt           pack/vietnamese.vtt
           cp work/subtitle_geometry.json   pack/subtitle_geometry.json
           cp work/static_regions.json      pack/static_regions.json
-
           ZIP="${SLUG}.zip"
           rm -f "$ZIP"
           (cd pack && zip -0 -q -r "../$ZIP" .)
           unzip -tq "$ZIP"
           SIZE=$(stat -c %s "$ZIP")
           echo "ZIP: $ZIP = $((SIZE / 1048576)) MB"
-
           ID=""
           MAX=6
           for attempt in $(seq 1 "$MAX"); do
@@ -1999,14 +2290,12 @@ jobs:
             [ "$attempt" -lt "$MAX" ] && sleep $(( attempt * 10 ))
           done
           [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử'; exit 1; }
-
           # Kiểm tra lại: size trên Pixeldrain phải khớp file local
           info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
             "https://pixeldrain.com/api/file/${ID}/info")
           remote_size=$(jq -r '.size' <<<"$info")
           echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)"
           [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local'; exit 1; }
-
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           echo "Link: https://pixeldrain.com/u/${ID}"
       - name: Notify VPS (type=mix) -> VPS sẽ gọi workflow phần 2
