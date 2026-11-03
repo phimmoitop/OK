@@ -178,29 +178,119 @@ jobs:
               sys.exit(1)
           PY
       # ============================================================
-      # RENDER: blur sub gốc + che watermark + burn sub Việt + ghép audio mix sẵn
+      # RENDER: blur sub gốc THEO ĐOẠN VỊ TRÍ + che watermark + burn sub Việt + ghép audio mix sẵn
+      #   - Các đoạn có vị trí sub gần giống nhau được gộp thành 1 "level" blur
+      #     (thường chỉ 1-4 level) -> mỗi level 1 nhánh crop+gblur, bật/tắt bằng enable=between(t,..)
+      #   - Sub Việt đặt đúng y của đoạn chứa nó
       # ============================================================
-      - name: Render Vietnamese video and HLS with detected subtitle blur
+      - name: Render Vietnamese video and HLS with per-segment subtitle blur
         run: |
           set -euo pipefail
           python3 <<'PY'
           import json, math, re, subprocess
+          from bisect import bisect_right
           from pathlib import Path
           import cv2
           import numpy as np
           import pysubs2
           geo = json.loads(Path("work/subtitle_geometry.json").read_text(encoding="utf-8"))
-          if not geo.get("valid") or not geo.get("blur"):
+          segs = sorted(geo.get("segments") or [], key=lambda s: s["t_start"])
+          if not geo.get("valid") or not segs:
               raise SystemExit("Subtitle geometry was not validated; refusing to render.")
           width, height = int(geo["video_width"]), int(geo["video_height"])
-          blur = geo["blur"]
+          duration = float(geo["duration_seconds"])
           sub_h = int(geo["subtitle_height"])
-          center_x, center_y = width // 2, int(geo["subtitle_center_y"])
-          blur_w, blur_h = int(blur["width"]), int(blur["height"])
-          blur_x, blur_y = int(blur["x"]), int(blur["y"])
+          center_x = width // 2
           sigma = max(24, int(round(sub_h * .80)))
-          feather_x = max(8, int(round(blur_h * .27)))
-          feather_y = max(3, int(round(blur_h * .09)))
+          PAD = 1.0          # mỗi đoạn blur rộng thêm +-1s quanh ranh giới đổi vị trí
+          MAX_LEVELS = 6     # tối đa số nhánh blur (càng ít càng render nhanh)
+          seg_starts = [s["t_start"] for s in segs]
+          def seg_at(ms):
+              i = bisect_right(seg_starts, ms / 1000.0) - 1
+              return segs[max(0, min(i, len(segs) - 1))]
+          # ------------------------------------------------------------
+          # Gom các đoạn có vùng blur gần giống nhau thành "level"
+          # ------------------------------------------------------------
+          def union(a, b):
+              return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+          def close(a, b):
+              h = max(a[3] - a[1], b[3] - b[1])
+              tol = max(6, int(.25 * h))
+              return abs(a[1] - b[1]) <= tol and abs(a[3] - b[3]) <= tol
+          levels = []
+          for si, s in enumerate(segs):
+              b = s["blur"]
+              rect = [int(b["x"]), int(b["y"]), int(b["x"] + b["width"]), int(b["y"] + b["height"])]
+              a_t = 0.0 if si == 0 else max(0.0, s["t_start"] - PAD)
+              e_t = duration + 10.0 if si == len(segs) - 1 else s["t_end"] + PAD
+              for lv in levels:
+                  if close(lv["rect"], rect):
+                      lv["rect"] = union(lv["rect"], rect)
+                      lv["iv"].append((a_t, e_t))
+                      break
+              else:
+                  levels.append({"rect": rect, "iv": [(a_t, e_t)]})
+          while len(levels) > MAX_LEVELS:
+              best = None
+              for i in range(len(levels)):
+                  for j in range(i + 1, len(levels)):
+                      ci = (levels[i]["rect"][1] + levels[i]["rect"][3]) / 2.0
+                      cj = (levels[j]["rect"][1] + levels[j]["rect"][3]) / 2.0
+                      d = abs(ci - cj)
+                      if best is None or d < best[0]:
+                          best = (d, i, j)
+              _, i, j = best
+              levels[i]["rect"] = union(levels[i]["rect"], levels[j]["rect"])
+              levels[i]["iv"] += levels[j]["iv"]
+              del levels[j]
+          def merge_iv(iv):
+              iv = sorted(iv)
+              out = [list(iv[0])]
+              for a, b in iv[1:]:
+                  if a <= out[-1][1] + 0.01:
+                      out[-1][1] = max(out[-1][1], b)
+                  else:
+                      out.append([a, b])
+              return [(a, b) for a, b in out]
+          clean_levels = []
+          for lv in levels:
+              x1, y1, x2, y2 = lv["rect"]
+              x1, y1 = max(0, x1) // 2 * 2, max(0, y1) // 2 * 2
+              x2, y2 = min(width, x2), min(height, y2)
+              w, h = (x2 - x1) // 2 * 2, (y2 - y1) // 2 * 2
+              if w < 16 or h < 8:
+                  continue
+              clean_levels.append({"x": x1, "y": y1, "w": w, "h": h, "iv": merge_iv(lv["iv"])})
+          levels = clean_levels
+          if not levels:
+              raise SystemExit("No valid blur level; refusing to render.")
+          def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
+              """Mat na alpha feather. sides = (trai, phai, tren, duoi); 0 = canh do KHONG feather
+              (dung cho canh sat mep video de dai sat mep van duoc lam mo 100%)."""
+              fx, fy = float(max(1, fx)), float(max(1, fy))
+              xs = np.arange(w, dtype=np.float32)[None, :]
+              ys = np.arange(h, dtype=np.float32)[:, None]
+              big = np.float32(1e6)
+              l = xs / fx if sides[0] else big
+              r = (w - 1 - xs) / fx if sides[1] else big
+              t = ys / fy if sides[2] else big
+              b = (h - 1 - ys) / fy if sides[3] else big
+              alpha = np.clip(np.minimum(np.minimum(l, r), np.minimum(t, b)), 0.0, 1.0)
+              alpha = np.broadcast_to(alpha, (h, w))
+              cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
+          for old in Path("work").glob("blur_mask_*.png"):
+              old.unlink()
+          for k, lv in enumerate(levels):
+              fx = max(8, int(round(lv["h"] * .27)))
+              fy = max(3, int(round(lv["h"] * .09)))
+              feather_mask(lv["w"], lv["h"], fx, fy, f"work/blur_mask_{k}.png")
+          def enable_expr(iv):
+              if len(iv) == 1 and iv[0][0] <= 0.01 and iv[0][1] >= duration:
+                  return ""
+              return ":enable='" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in iv) + "'"
+          # ------------------------------------------------------------
+          # Phụ đề Việt (ASS): đặt theo y của đoạn chứa dòng sub
+          # ------------------------------------------------------------
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
           FONT_SCALE = 1.35
@@ -224,27 +314,13 @@ jobs:
           for ev in vi.events:
               text = ev.text.replace("\\N", "\\N").replace("\n", "\\N")
               text = text.replace("{", "\\{").replace("}", "\\}")
+              cy = int(seg_at((ev.start + ev.end) / 2.0)["center_y"])
               ass.append(
                   f"Dialogue: 0,{ass_time(ev.start)},{ass_time(ev.end)},Default,,0,0,0,,"
-                  f"{{\\an5\\pos({center_x},{center_y})}}{text}"
+                  f"{{\\an5\\pos({center_x},{cy})}}{text}"
               )
           Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
-          def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
-              """Mat na alpha feather. sides = (trai, phai, tren, duoi); 0 = canh do KHONG feather
-              (dung cho canh sat mep video de dai sat mep van duoc lam mo 100%)."""
-              fx, fy = float(max(1, fx)), float(max(1, fy))
-              xs = np.arange(w, dtype=np.float32)[None, :]
-              ys = np.arange(h, dtype=np.float32)[:, None]
-              big = np.float32(1e6)
-              l = xs / fx if sides[0] else big
-              r = (w - 1 - xs) / fx if sides[1] else big
-              t = ys / fy if sides[2] else big
-              b = (h - 1 - ys) / fy if sides[3] else big
-              alpha = np.clip(np.minimum(np.minimum(l, r), np.minimum(t, b)), 0.0, 1.0)
-              alpha = np.broadcast_to(alpha, (h, w))
-              cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
-          feather_mask(blur_w, blur_h, feather_x, feather_y, "work/blur_mask.png")
-          # ---- Vùng che cố định (watermark / quảng cáo 2 bên / FULL góc) từ bước static_detect ----
+          # ---- Vùng che cố định (watermark 2 góc trên) từ bước static_detect ----
           regions = []
           sp = Path("work/static_regions.json")
           if sp.exists():
@@ -266,46 +342,54 @@ jobs:
           for k, (x, y, w, h, fs) in enumerate(regions):
               fx = max(4, int(round(min(w, h) * .18)))
               feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png", sides=fs)
-          # Input: 0 = raw_video.mp4, 1 = work/mixed_audio.m4a, 2 = work/blur_mask.png (lặp),
-          #        3.. = work/static_mask_k.png (lặp)
-          n_split = 2 + len(regions)
-          graph = ["[0:v]split=%d[vbase][vpatchsrc]" % n_split
+          # Input: 0 = raw_video.mp4, 1 = work/mixed_audio.m4a,
+          #        2..(1+L) = work/blur_mask_k.png (lặp, mỗi level 1 mask),
+          #        (2+L).. = work/static_mask_k.png (lặp)
+          L = len(levels)
+          n_split = 1 + L + len(regions)
+          graph = ["[0:v]split=%d[vbase]" % n_split
+                   + "".join(f"[lv{k}]" for k in range(L))
                    + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
           cur = "vbase"
           for k, (x, y, w, h, fs) in enumerate(regions):
               sg = max(10, min(60, int(round(h * .60))))
               graph.append(
                   f"[sp{k}]crop={w}:{h}:{x}:{y},gblur=sigma={sg},format=rgb24[sb{k}];"
-                  f"[{3 + k}:v]format=gray[sm{k}];"
+                  f"[{2 + L + k}:v]format=gray[sm{k}];"
                   f"[sb{k}][sm{k}]alphamerge[sq{k}];"
                   f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
               )
               cur = f"sv{k}"
-          graph.append(
-              f"[vpatchsrc]crop={blur_w}:{blur_h}:{blur_x}:{blur_y},"
-              f"gblur=sigma={sigma},format=rgb24[vblur];"
-              f"[2:v]format=gray[vmask];"
-              f"[vblur][vmask]alphamerge[vpatch];"
-              f"[{cur}][vpatch]overlay=x={blur_x}:y={blur_y}:shortest=1,"
-              f"subtitles=work/vietnamese-overlay.ass[v]"
-          )
+          for k, lv in enumerate(levels):
+              graph.append(
+                  f"[lv{k}]crop={lv['w']}:{lv['h']}:{lv['x']}:{lv['y']},"
+                  f"gblur=sigma={sigma},format=rgb24[lb{k}];"
+                  f"[{2 + k}:v]format=gray[lm{k}];"
+                  f"[lb{k}][lm{k}]alphamerge[lq{k}];"
+                  f"[{cur}][lq{k}]overlay=x={lv['x']}:y={lv['y']}:shortest=1{enable_expr(lv['iv'])}[lo{k}];"
+              )
+              cur = f"lo{k}"
+          graph.append(f"[{cur}]subtitles=work/vietnamese-overlay.ass[v]")
           video_graph = "".join(graph)
           Path("work/render-filter.txt").write_text(video_graph + "\n", encoding="utf-8")
-          print(f"Subtitle text bbox: center_y={center_y}, height={sub_h}px")
-          print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}; fixed for full video.")
+          print(f"Subtitle segments: {len(segs)} | blur levels: {L} (sigma={sigma})")
+          for i, s in enumerate(segs[:40]):
+              print(f"  seg[{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s center_y={s['center_y']}")
+          for k, lv in enumerate(levels):
+              span = ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in lv["iv"][:8])
+              print(f"  level[{k}] x={lv['x']} y={lv['y']} w={lv['w']} h={lv['h']} | {len(lv['iv'])} khoang: {span}")
           print(f"Static overlay blur regions: {len(regions)}")
           for k, (x, y, w, h, fs) in enumerate(regions):
               print(f"  [{k}] x={x} y={y} w={w} h={h} feather(l,r,t,b)={fs}")
-          print(f"Vietnamese overlay: centered at ({center_x},{center_y}), font={font_size}px.")
+          print(f"Vietnamese overlay: font={font_size}px, y theo từng đoạn.")
           PY
           DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
-          # Mỗi vùng che cố định cần 1 input mặt nạ lặp (input 3, 4, ...)
+          # Thứ tự input mask phải khớp filter graph: blur_mask_0..L-1 trước, rồi static_mask_0..
           EXTRA=()
-          for m in $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
+          for m in $(ls work/blur_mask_*.png 2>/dev/null | sort -V) $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
             EXTRA+=(-loop 1 -framerate 30 -t "$DUR" -i "$m")
           done
           ffmpeg -y -i raw_video.mp4 -i work/mixed_audio.m4a \
-            -loop 1 -framerate 30 -t "$DUR" -i work/blur_mask.png \
             "${EXTRA[@]}" \
             -filter_complex_script work/render-filter.txt \
             -map "[v]" -map 1:a:0 \
