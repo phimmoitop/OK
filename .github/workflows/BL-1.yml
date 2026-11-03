@@ -132,7 +132,7 @@ jobs:
           print("Cookie file prepared (values hidden).")
           PY
       - name: Download Bilibili video
-        timeout-minutes: 90
+        timeout-minutes: 180
         env:
           VIDEO_URL: ${{ inputs.link }}
           MAX_ATTEMPTS: "40"
