@@ -222,7 +222,7 @@ jobs:
           FAST_HALF_K = 0.8        # nua chieu cao dai FAST = th * K (cu 1.25 -> dai qua cao)
           FAST_STRIP_MAX_RATIO = 0.22   # dai FAST cao hon ty le nay cua video -> coi la do hong, tat FAST
           FAST_MIN_SCORE = 0.70    # FAST: diem toi thieu de giu ket qua (cu 0.50)
-          BLUR_H_K = 1.5           # chieu cao vung blur = text_height * K
+          BLUR_H_K = 1.2           # chieu cao vung blur = text_height * K
           TH_MAX_RATIO = 0.12      # chieu cao chu > ty le nay cua video -> bo neo (do hong)
           CHANGE_TOL_K = 0.8       # lech y > max(10, K*th) moi coi la doi vi tri (cu 0.35)
           CHANGE_MIN_ANCHORS = 2   # can >= N neo lien tiep cung lech moi tach doan
@@ -552,8 +552,8 @@ jobs:
               th = seg["height"]
               bh = max(24, int(math.ceil(th * BLUR_H_K / 2.0) * 2))
               bh = min(bh, int(height * .18) // 2 * 2)
-              top = seg["cy_lo"] - bh / 2.0
-              bot = seg["cy_hi"] + bh / 2.0
+              top = seg["center_y"] - bh / 2.0
+              bot = seg["center_y"] + bh / 2.0
               cap = int(height * .28)
               if bot - top > cap:
                   mid = seg["center_y"]
