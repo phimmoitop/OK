@@ -196,12 +196,17 @@ jobs:
         run: |
           cat > ocr_run.py <<'PY'
           """
-          OCR sub cung (hardsub) 2 giai doan:
-            1) Lay mau thua (~300 frame) tren vung rong -> tim dai (band) chua sub.
-               TRUOC khi chon dai, loai bo chu TINH (watermark/logo xuat hien suot video).
-            2) OCR toan video 3fps CHI tren dai mong do, doc rawvideo tu ffmpeg (khong JPEG),
-               bo qua frame khi chu khong doi, chay song song nhieu process.
-          Sau do gom cue + do hinh hoc blur nhu ban cu.
+          OCR sub cung (hardsub) theo DIEM NEO (anchor) moi 30s.
+
+          1) Chia video thanh cac cua so 30s. Moi cua so lay ~8 frame, det+rec tren vung rong
+             -> tim dai (band) chua sub => 1 diem neo (cy, chieu cao chu, thoi diem thay sub dau/cuoi).
+             Chu TINH (watermark/logo) duoc loai tren TOAN BO mau (khong phai tung cua so).
+          2) Cua so khong co sub -> khong tao neo (se dung vi tri neo truoc/sau).
+          3) Gom cac neo lien tiep co cy gan nhau thanh 1 DOAN (segment). Neu 2 neo lien ke
+             lech y -> DO NHI PHAN giua 2 neo de tim thoi diem doi vi tri (~1.5s).
+          4) OCR toan video 3fps, moi doan dung dai mong rieng cua no. Che do FAST (chi rec)
+             duoc tu kiem tra 1 lan tren toan bo cac neo.
+          5) Xuat work/subtitle_geometry.json dang { segments: [ {t_start,t_end,center_y,height,blur{}} ] }.
           """
           import cv2, json, math, os, re, subprocess, sys, time
           import multiprocessing as mp
@@ -212,11 +217,17 @@ jobs:
           OUT = Path("work/ocr")
           FPS = 3.0
           STEP = 1.0 / FPS
-          SPARSE_SAMPLES = 150
-          MAX_REUSE = 2        # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
-          SAME_IOU = 0.85      # nguong giong nhau cua mat na chu sang
-          FAST_HALF_K = 1.25   # nửa chiều cao dải OCR fast = text_height * K (cũ 0.9 → ~100px, 1.35 → ~150px)
-          BLUR_H_K = 1.5       # chiều cao vùng blur = text_height * K (cũ 1.1)
+          WIN = 30.0               # khoang cach giua 2 diem neo (giay)
+          SAMPLES_PER_WIN = 8      # so frame mau moi cua so (video ngan se tu tang)
+          MIN_WIN_FRAMES = 2       # cua so can >= N frame co sub moi tao neo
+          MAX_REUSE = 2            # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
+          SAME_IOU = 0.85          # nguong giong nhau cua mat na chu sang
+          FAST_HALF_K = 1.25       # nua chieu cao dai OCR fast = text_height * K
+          BLUR_H_K = 1.5           # chieu cao vung blur = text_height * K
+          CHANGE_TOL_K = 0.35      # 2 neo lech y > max(8, K*chieu cao chu) => coi la DOI vi tri
+          REFINE_MIN_GAP = 1.5     # dung do nhi phan khi khoang < N giay
+          REFINE_MAX_IT = 7        # so vong do nhi phan toi da cho moi diem doi
+          SEG_PAD = 1.0            # moi doan OCR rong them +-N giay quanh ranh gioi
           def log(msg):
               print(msg, flush=True)
           def make_engine():
@@ -230,6 +241,8 @@ jobs:
               h, w = gray.shape
               need = max(30, int(h * w * 0.0001))
               return cv2.countNonZero(cv2.Canny(gray, 80, 180)) >= need
+          def norm_text(t):
+              return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
           def run_ocr(engine, crop, x_off, y_off, frame_no):
               dets = []
               result, _ = engine(crop)
@@ -249,11 +262,32 @@ jobs:
                       "cy": (min(ys) + max(ys)) / 2.0
                   })
               return dets
-          def drop_static(dets):
-              """Loai watermark/logo: chu co cung vi tri+kich thuoc, xuat hien suot video.
-              Sub that thi doi chu lien tuc nen khong bi loai."""
+          def rec_only(engine, img):
+              """Chi chay nhan dang (bo phat hien chu): nhanh hon rat nhieu, dung cho 1 dong sub."""
+              try:
+                  r, _ = engine(img, use_det=False, use_cls=False, use_rec=True)
+              except Exception:
+                  return "", 0.0
+              if not r:
+                  return "", 0.0
+              return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
+          def grab_frame(t, width, height):
+              """Lay 1 frame tai thoi diem t bang ffmpeg CLI (seek on dinh, khong dung cv2 seek)."""
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}",
+                     "-i", VIDEO, "-frames:v", "1", "-an",
+                     "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+              out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+              if len(out) < width * height * 3:
+                  return None
+              return np.frombuffer(out, np.uint8)[:width * height * 3].reshape(height, width, 3).copy()
+          # ------------------------------------------------------------
+          # CHU TINH (watermark / logo)
+          # ------------------------------------------------------------
+          def find_static(dets):
+              """Tim watermark/logo: chu co cung vi tri+kich thuoc, xuat hien suot video.
+              Sub that thi doi chu lien tuc nen khong bi tinh la tinh. Tra ve None neu khong co."""
               if len(dets) < 10:
-                  return dets
+                  return None
               fr = np.array([d["frame"] for d in dets])
               x1 = np.array([d["x1"] for d in dets])
               x2 = np.array([d["x2"] for d in dets])
@@ -269,16 +303,19 @@ jobs:
                   if nf >= 10 and nf >= 0.25 * all_frames and spread >= 0.6:
                       static_idx.append(i)
               if not static_idx:
-                  return dets
-              sset = set(static_idx)
+                  return None
               static_txt = {norm_text(dets[i]["text"]) for i in static_idx}
               boxes = {(round(dets[i]["x1"] / 10), round(dets[i]["x2"] / 10), round(dets[i]["cy"] / 10))
                        for i in static_idx}
               sb = [(a * 10, b * 10, c * 10) for a, b, c in boxes]
+              log(f"[STATIC] phat hien watermark: {sorted(static_txt)[:5]}")
+              return {"txt": static_txt, "sb": sb}
+          def apply_static(dets, st):
+              if not st:
+                  return dets
+              static_txt, sb = st["txt"], st["sb"]
               keep = []
-              for i, d in enumerate(dets):
-                  if i in sset:
-                      continue
+              for d in dets:
                   t = norm_text(d["text"])
                   near = any(abs(d["cy"] - c) < 20 for _, _, c in sb)
                   if near:
@@ -290,10 +327,10 @@ jobs:
                       if similar or inside:
                           continue
                   keep.append(d)
-              log(f"[STATIC] loai {len(dets) - len(keep)}/{len(dets)} detection (watermark): "
-                  f"{sorted(static_txt)[:5]}")
+              if len(keep) != len(dets):
+                  log(f"[STATIC] loai {len(dets) - len(keep)}/{len(dets)} detection (watermark)")
               return keep
-          def pick_band(dets, height):
+          def pick_band(dets, height, min_frames=3):
               """Gom box theo vi tri doc, tra ve dai on dinh nhat + tolerance."""
               tolerance = max(18.0, height * .065)
               bands = []
@@ -305,7 +342,7 @@ jobs:
                       min(choices, key=lambda item: item[0])[1].append(d)
                   else:
                       bands.append([d])
-              bands = [b for b in bands if len({d["frame"] for d in b}) >= 3]
+              bands = [b for b in bands if len({d["frame"] for d in b}) >= min_frames]
               if not bands:
                   return [], tolerance
               band = max(bands, key=lambda b: (
@@ -313,37 +350,30 @@ jobs:
                   sum(d["score"] for d in b),
                   sum(len(d["text"]) for d in b)))
               return band, tolerance
-          def grab_frame(t, width, height):
-              """Lay 1 frame tai thoi diem t bang ffmpeg CLI (seek on dinh, khong dung cv2 seek)."""
-              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
-                     "-i", VIDEO, "-frames:v", "1", "-an",
-                     "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
-              out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-              if len(out) < width * height * 3:
-                  return None
-              return np.frombuffer(out, np.uint8)[:width * height * 3].reshape(height, width, 3).copy()
           # ------------------------------------------------------------
-          # GIAI DOAN 1: mau thua -> dai mong
+          # GIAI DOAN 1: MAU THUA THEO CUA SO 30s -> DIEM NEO
           # ------------------------------------------------------------
-          def norm_text(t):
-              return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
-          def rec_only(engine, img):
-              """Chi chay nhan dang (bo phat hien chu): nhanh hon rat nhieu, dung cho 1 dong sub."""
-              try:
-                  r, _ = engine(img, use_det=False, use_cls=False, use_rec=True)
-              except Exception:
-                  return "", 0.0
-              if not r:
-                  return "", 0.0
-              return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
-          def find_strip(duration, width, height, x0, x1, y0):
-              """Tra ve (sy0, sy1, found, info). info co cy, th, fast_ok (co dung duoc che do nhanh khong)."""
+          def plan_samples(duration):
+              n_win = max(1, int(math.ceil(duration / WIN)))
+              spw = min(30, max(SAMPLES_PER_WIN, int(math.ceil(30.0 / n_win))))
+              items, sid = [], 0
+              for w in range(n_win):
+                  a = w * WIN
+                  b = min(duration, (w + 1) * WIN)
+                  ln = b - a
+                  if ln <= 0.5:
+                      continue
+                  n = max(3, min(spw, int(ln)))
+                  for j in range(n):
+                      t = a + (j + 0.5) * ln / n
+                      items.append((sid, w, min(t, max(0.0, duration - 0.2))))
+                      sid += 1
+              return n_win, items
+          def sample_worker(task):
+              width, height, x0, x1, y0, items = task
               engine = make_engine()
-              n = int(min(SPARSE_SAMPLES, max(30, duration / 5)))
               dets = []
-              kept = {}   # luu toi da 80 crop de tu kiem tra che do nhanh
-              for i in range(n):
-                  t = duration * (i + 0.5) / n
+              for sid, win, t in items:
                   image = grab_frame(t, width, height)
                   if image is None:
                       continue
@@ -351,50 +381,151 @@ jobs:
                   gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       continue
-                  found_dets = run_ocr(engine, crop, x0, y0, i)
-                  dets.extend(found_dets)
-                  if found_dets and len(kept) < 80:
-                      kept[i] = crop.copy()
-              dets = drop_static(dets)
-              band, tolerance = pick_band(dets, height)
-              if not band:
-                  return y0, height, False, None
-              cy = float(np.median([d["cy"] for d in band]))
-              th = float(np.percentile([d["y2"] - d["y1"] for d in band], 90))
-              half = int(max(th * 1.6, tolerance * 1.1))
-              sy0 = max(y0, int(cy - half))
-              sy1 = min(height, int(cy + half))
-              if sy1 - sy0 < 16:
-                  return y0, height, False, None
-              # ---- tu kiem tra: nhan dang-rieng tren dong sub co khop ket qua det+rec khong? ----
-              ty0 = max(y0, int(cy - th * FAST_HALF_K))
-              ty1 = min(height, int(cy + th * FAST_HALF_K))
-              by_frame = {}
+                  for d in run_ocr(engine, crop, x0, y0, sid):
+                      d["time"] = t
+                      d["win"] = win
+                      dets.append(d)
+              return dets
+          def build_anchor(win, band, height):
+              """Tu cac box cua dai trong 1 cua so -> (cy, th) theo hop (union) tung frame."""
+              by = {}
               for d in band:
-                  by_frame.setdefault(d["frame"], []).append(d)
+                  by.setdefault(d["frame"], []).append(d)
+              cys, hs = [], []
+              for items in by.values():
+                  y1 = min(d["y1"] for d in items)
+                  y2 = max(d["y2"] for d in items)
+                  cys.append((y1 + y2) / 2.0)
+                  hs.append(y2 - y1)
+              cy = float(np.median(cys))
+              th = float(np.percentile(hs, 90))
+              ok = (th >= max(8, height * .012) and th <= height * .12
+                    and height * .35 <= cy <= height * .98)
+              if not ok:
+                  return None
+              times = [d["time"] for d in band]
+              return {"win": win, "cy": cy, "th": th, "frames": len(by), "by": by,
+                      "t_first": float(min(times)), "t_last": float(max(times)),
+                      "t_mid": float(np.median(times))}
+          def anchor_strip(cy_lo, cy_hi, th, y0, height):
+              ty0 = max(y0, int(cy_lo - th * FAST_HALF_K))
+              ty1 = min(height, int(math.ceil(cy_hi + th * FAST_HALF_K)))
+              return ty0, ty1
+          def fast_check(anchors, width, height, x0, x1, y0):
+              """Tu kiem tra che do nhanh tren cac neo that: rec-only co khop det+rec khong."""
+              engine = make_engine()
+              cands = []
+              for a in anchors:
+                  ty0, ty1 = anchor_strip(a["cy"], a["cy"], a["th"], y0, height)
+                  for sid, items in a["by"].items():
+                      ref = norm_text("".join(d["text"] for d in sorted(items, key=lambda d: d["x1"])))
+                      if len(ref) >= 2 and ty1 - ty0 >= 8:
+                          cands.append((items[0]["time"], ref, ty0, ty1))
+              if len(cands) > 60:
+                  stride = len(cands) / 60.0
+                  cands = [cands[int(i * stride)] for i in range(60)]
               sims = []
-              for fi, items in by_frame.items():
-                  if fi not in kept:
+              for t, ref, ty0, ty1 in cands:
+                  image = grab_frame(t, width, height)
+                  if image is None:
                       continue
-                  items.sort(key=lambda d: d["x1"])
-                  ref = norm_text("".join(d["text"] for d in items))
-                  if len(ref) < 2:
-                      continue
-                  line = kept[fi][ty0 - y0:ty1 - y0]
+                  line = image[ty0:ty1, x0:x1]
                   if line.shape[0] < 8:
                       continue
                   txt, _ = rec_only(engine, line)
                   sims.append(SequenceMatcher(None, ref, norm_text(txt)).ratio())
-              fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.7
-              log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh "
-                  f"{(float(np.mean(sims)) if sims else 0):.2f} -> {'DUNG che do nhanh' if fast_ok else 'KHONG dung (dung det+rec)'}")
-              info = {"cy": cy, "th": th, "ty0": ty0, "ty1": ty1, "fast_ok": fast_ok}
-              return sy0, sy1, True, info
+              mean = float(np.mean(sims)) if sims else 0.0
+              ok = len(sims) >= 8 and mean >= 0.7
+              log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh {mean:.2f} -> "
+                  f"{'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
+              return ok
           # ------------------------------------------------------------
-          # GIAI DOAN 2: OCR toan video tren dai mong (song song)
+          # DO NHI PHAN DIEM DOI VI TRI GIUA 2 NEO
+          # ------------------------------------------------------------
+          def observe(engine, t, ctx, cy_a, cy_b, tolm, st):
+              """Tai thoi diem t: sub dang o vi tri A hay B? None neu khong thay sub."""
+              width, height, x0, x1, y0 = ctx
+              image = grab_frame(t, width, height)
+              if image is None:
+                  return None
+              crop = image[y0:height, x0:x1]
+              gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+              if not has_text_edges(gray):
+                  return None
+              dets = apply_static(run_ocr(engine, crop, x0, y0, 0), st)
+              na = nb = 0
+              for d in dets:
+                  da, db = abs(d["cy"] - cy_a), abs(d["cy"] - cy_b)
+                  if da <= db and da <= tolm:
+                      na += 1
+                  elif db < da and db <= tolm:
+                      nb += 1
+              if na == 0 and nb == 0:
+                  return None
+              return "a" if na >= nb else "b"
+          def refine(engine, ctx, t_a, t_b, cy_a, cy_b, th, st):
+              lo, hi = t_a, t_b
+              tolm = max(18.0, th * .9)
+              offsets = [0, .5, -.5, 1, -1, 1.5, -1.5, 2.5, -2.5, 4, -4, 6, -6]
+              probes = 0
+              for _ in range(REFINE_MAX_IT):
+                  if hi - lo <= REFINE_MIN_GAP:
+                      break
+                  mid = (lo + hi) / 2.0
+                  got = False
+                  for off in offsets:
+                      tf = mid + off
+                      if not (lo + 0.05 < tf < hi - 0.05):
+                          continue
+                      probes += 1
+                      side = observe(engine, tf, ctx, cy_a, cy_b, tolm, st)
+                      if side is None:
+                          continue
+                      if side == "a":
+                          lo = tf
+                      else:
+                          hi = tf
+                      got = True
+                      break
+                  if not got:
+                      break
+              b = (lo + hi) / 2.0
+              log(f"[REFINE] {t_a:.1f}s..{t_b:.1f}s (y {cy_a:.0f} -> {cy_b:.0f}) => doi tai ~{b:.1f}s ({probes} probe)")
+              return b
+          def group_anchors(real):
+              groups = []
+              for a in real:
+                  if groups:
+                      g = groups[-1]
+                      tol = max(8.0, CHANGE_TOL_K * max(a["th"], g[0]["th"]))
+                      if abs(a["cy"] - g[0]["cy"]) <= tol:
+                          g.append(a)
+                          continue
+                  groups.append([a])
+              return groups
+          def make_blur(seg, width, height):
+              th = seg["height"]
+              bh = max(24, int(math.ceil(th * BLUR_H_K / 2.0) * 2))
+              bh = min(bh, int(height * .18) // 2 * 2)
+              top = seg["cy_lo"] - bh / 2.0
+              bot = seg["cy_hi"] + bh / 2.0
+              cap = int(height * .28)
+              if bot - top > cap:
+                  mid = seg["center_y"]
+                  top, bot = mid - cap / 2.0, mid + cap / 2.0
+              top = max(0, int(top))
+              bot = min(height, int(math.ceil(bot)))
+              y = top // 2 * 2
+              h = max(2, (bot - y) // 2 * 2)
+              bw = max(2, int(width * .80) // 2 * 2)
+              bx = (width - bw) // 2
+              return {"x": bx, "y": y, "width": bw, "height": h, "width_ratio": .80,
+                      "center_y": int(round(seg["center_y"]))}
+          # ------------------------------------------------------------
+          # GIAI DOAN 2: OCR toan video theo tung doan (song song)
           # ------------------------------------------------------------
           def worker(task):
-              start_frame, n_frames, x0, y0, x1, y1 = task
+              seg, start_frame, n_frames, x0, y0, x1, y1 = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
@@ -415,7 +546,7 @@ jobs:
                   k += 1
                   if k % 40 == 0:
                       el = time.time() - t_w
-                      log(f"[worker@{start_frame}] {k}/{n_frames} frames, ocr_calls={ocr_calls}, "
+                      log(f"[worker seg{seg}@{start_frame}] {k}/{n_frames} frames, ocr_calls={ocr_calls}, "
                           f"{el:.0f}s, {el / k:.2f}s/frame")
                   frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -439,11 +570,13 @@ jobs:
                   dets.extend(cur)
               proc.stdout.close()
               proc.wait()
-              log(f"[worker@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
+              for d in dets:
+                  d["seg"] = seg
+              log(f"[worker seg{seg}@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
               return dets
           def worker_fast(task):
               """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu."""
-              start_frame, n_frames, x0, y0, x1, y1, cy, th = task
+              seg, start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
@@ -464,7 +597,7 @@ jobs:
                   k += 1
                   if k % 100 == 0:
                       el = time.time() - t_w
-                      log(f"[fast@{start_frame}] {k}/{n_frames} frames, rec_calls={calls}, {el:.0f}s, {el / k:.2f}s/frame")
+                      log(f"[fast seg{seg}@{start_frame}] {k}/{n_frames} frames, rec_calls={calls}, {el:.0f}s, {el / k:.2f}s/frame")
                   frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
@@ -474,14 +607,25 @@ jobs:
                   cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
                   if cjk < 2 or score < .50:
                       continue
-                  # Khong co box that: dung cy/chieu cao do tu buoc lay mau thua
+                  # Khong co box that: dung cy/chieu cao cua doan
                   dets.append({"frame": fn, "time": fn * STEP, "text": text, "score": score,
                                "x1": float(x0), "x2": float(x1),
-                               "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy})
+                               "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy, "seg": seg})
               proc.stdout.close()
               proc.wait()
-              log(f"[fast@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
+              log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
               return dets
+          def stamp(seconds):
+              ms = max(0, round(seconds * 1000))
+              hh, ms = divmod(ms, 3600000)
+              mm, ms = divmod(ms, 60000)
+              ss, ms = divmod(ms, 1000)
+              return f"{hh:02}:{mm:02}:{ss:02},{ms:03}"
+          def write_gh_output(needs_review):
+              gh = os.environ.get("GITHUB_OUTPUT")
+              if gh:
+                  with open(gh, "a", encoding="utf-8") as f:
+                      f.write(f"needs_review={'true' if needs_review else 'false'}\n")
           def main():
               OUT.mkdir(parents=True, exist_ok=True)
               t_start = time.time()
@@ -494,96 +638,174 @@ jobs:
               cap.release()
               if width <= 0 or height <= 0:
                   raise SystemExit("Cannot read source video dimensions")
-              fps = FPS
               step = STEP
               # Vung tim kiem: giua 65% ngang, 35% duoi (tranh chu AI o goc phai duoi)
               x0, x1 = round(width * .175), round(width * .825)
               y0 = round(height * .65)
-              sy0, sy1, found, info = find_strip(duration, width, height, x0, x1, y0)
-              fast = bool(found and info and info["fast_ok"] and os.environ.get("OCR_FAST", "1") == "1")
-              if found:
-                  log(f"[STRIP] sub nam trong dai y={sy0}..{sy1} ({(sy1 - sy0) / (height - y0) * 100:.0f}% vung OCR cu)")
-              else:
-                  log("[STRIP] Khong tim thay dai sub tu mau thua -> OCR toan vung nhu cu")
-              log(f"[STRIP] mau thua xong sau {time.time() - t_start:.0f}s")
-              total_frames = int(duration * FPS)
+              ctx = (width, height, x0, x1, y0)
               nw = max(1, min(4, os.cpu_count() or 2))
-              per = math.ceil(total_frames / nw)
+              mp_ctx = mp.get_context("spawn")
+              geometry = {
+                  "video_width": width, "video_height": height, "duration_seconds": duration,
+                  "sample_fps": FPS, "window_seconds": WIN,
+                  "ocr_search": {"x_min": x0, "x_max": x1, "y_min": y0, "y_max": height},
+                  "segments": [], "subtitle_center_y": None, "subtitle_height": None, "valid": False
+              }
+              def write_invalid(reason):
+                  log(f"[GEOMETRY] KHONG HOP LE: {reason}")
+                  Path("work/subtitle_geometry.json").write_text(
+                      json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                  (OUT / "hardsub-3fps.srt").write_text("", encoding="utf-8")
+                  (OUT / "ocr-review-needed.tsv").write_text(
+                      "start\tend\tmean_confidence\tframes\ttext\treason\n", encoding="utf-8")
+                  write_gh_output(True)
+              # ---------- GIAI DOAN 1a: mau thua theo cua so 30s (song song) ----------
+              n_win, items = plan_samples(duration)
+              chunks = [items[i::nw] for i in range(nw)]
+              chunks = [c for c in chunks if c]
+              log(f"[ANCHOR] {n_win} cua so x {WIN:.0f}s | {len(items)} frame mau | {len(chunks)} worker")
+              if not chunks:
+                  write_invalid("khong lay duoc frame mau")
+                  return
+              with mp_ctx.Pool(len(chunks)) as pool:
+                  parts = pool.map(sample_worker, [(width, height, x0, x1, y0, c) for c in chunks], chunksize=1)
+              dets_all = [d for p in parts for d in p]
+              log(f"[ANCHOR] mau xong sau {time.time() - t_start:.0f}s, detections={len(dets_all)}")
+              # ---------- 1b: loai chu tinh tren TOAN BO mau, roi tao neo theo tung cua so ----------
+              static_info = find_static(dets_all)
+              dets_all = apply_static(dets_all, static_info)
+              by_win = {}
+              for d in dets_all:
+                  by_win.setdefault(d["win"], []).append(d)
+              anchors = [None] * n_win
+              for w, ds in by_win.items():
+                  band, _ = pick_band(ds, height, MIN_WIN_FRAMES)
+                  if band:
+                      anchors[w] = build_anchor(w, band, height)
+              real = [a for a in anchors if a]
+              log(f"[ANCHOR] {len(real)}/{n_win} cua so co neo sub")
+              with (OUT / "anchors.tsv").open("w", encoding="utf-8") as f:
+                  f.write("win\tt_first\tt_last\tcy\tth\tframes\n")
+                  for a in real:
+                      f.write(f"{a['win']}\t{a['t_first']:.2f}\t{a['t_last']:.2f}\t"
+                              f"{a['cy']:.1f}\t{a['th']:.1f}\t{a['frames']}\n")
+              if not real:
+                  write_invalid("khong tim thay neo sub nao")
+                  return
+              # ---------- 1c: tu kiem tra che do nhanh (1 lan cho ca video) ----------
+              fast = False
+              if os.environ.get("OCR_FAST", "1") == "1":
+                  fast = fast_check(real, width, height, x0, x1, y0)
+              # ---------- 1d: gom neo thanh cac doan + do nhi phan diem doi ----------
+              groups = group_anchors(real)
+              segs = []
+              for g in groups:
+                  cys = [a["cy"] for a in g]
+                  segs.append({"center_y": float(np.median(cys)), "cy_lo": float(min(cys)),
+                               "cy_hi": float(max(cys)), "height": float(max(a["th"] for a in g)),
+                               "t_start": 0.0, "t_end": duration, "anchors": len(g)})
+              log(f"[SEGMENT] {len(real)} neo -> {len(segs)} doan vi tri")
+              if len(segs) > 1:
+                  engine = make_engine()
+                  for i in range(len(groups) - 1):
+                      a, b = groups[i][-1], groups[i + 1][0]
+                      bnd = refine(engine, ctx, a["t_last"], b["t_first"],
+                                   segs[i]["center_y"], segs[i + 1]["center_y"],
+                                   max(segs[i]["height"], segs[i + 1]["height"]), static_info)
+                      segs[i]["t_end"] = bnd
+                      segs[i + 1]["t_start"] = bnd
+              tolerance = max(18.0, height * .065)
+              for s in segs:
+                  s["ty0"], s["ty1"] = anchor_strip(s["cy_lo"], s["cy_hi"], s["height"], y0, height)
+                  half = max(s["height"] * 1.6, tolerance * 1.1)
+                  s["sy0"] = max(y0, int(s["cy_lo"] - half))
+                  s["sy1"] = min(height, int(math.ceil(s["cy_hi"] + half)))
+                  s["blur"] = make_blur(s, width, height)
+                  if s["ty1"] - s["ty0"] < 16 or s["sy1"] - s["sy0"] < 16:
+                      fast = False
+              for i, s in enumerate(segs):
+                  log(f"[SEGMENT {i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']:.0f} "
+                      f"({s['cy_lo']:.0f}..{s['cy_hi']:.0f}) th={s['height']:.0f} | blur y={s['blur']['y']} h={s['blur']['height']}")
+              log(f"[ANCHOR] giai doan 1 xong sau {time.time() - t_start:.0f}s")
+              # ---------- GIAI DOAN 2: OCR toan video theo doan ----------
+              total_frames = int(duration * FPS)
+              ranges = []
+              for si, s in enumerate(segs):
+                  fa = 0 if si == 0 else int(max(0.0, s["t_start"] - SEG_PAD) * FPS)
+                  fb = total_frames if si == len(segs) - 1 else min(total_frames, int(math.ceil((s["t_end"] + SEG_PAD) * FPS)))
+                  if fb > fa:
+                      ranges.append((si, fa, fb))
+              tot = sum(fb - fa for _, fa, fb in ranges)
+              chunk = max(60, int(math.ceil(tot / float(nw * 4))))
               tasks = []
-              for i in range(nw):
-                  s = i * per
-                  n = min(per, total_frames - s)
-                  if n > 0:
+              for si, fa, fb in ranges:
+                  s = segs[si]
+                  for sf in range(fa, fb, chunk):
+                      n = min(chunk, fb - sf)
                       if fast:
-                          tasks.append((s, n, x0, info["ty0"], x1, info["ty1"], info["cy"], info["th"]))
+                          tasks.append((si, sf, n, x0, s["ty0"], x1, s["ty1"], s["center_y"], s["height"]))
                       else:
-                          tasks.append((s, n, x0, sy0, x1, sy1))
+                          tasks.append((si, sf, n, x0, s["sy0"], x1, s["sy1"]))
               log(f"[OCR] mode={'FAST rec-only' if fast else 'det+rec'} | {total_frames} frame, "
-                  f"{len(tasks)} worker, cpu_count={os.cpu_count()}")
-              ctx = mp.get_context("spawn")
-              with ctx.Pool(len(tasks)) as pool:
-                  parts = pool.map(worker_fast if fast else worker, tasks, chunksize=1)
+                  f"{len(tasks)} task, {len(segs)} doan, cpu_count={os.cpu_count()}")
+              with mp_ctx.Pool(max(1, min(nw, len(tasks)))) as pool:
+                  parts = list(pool.imap_unordered(worker_fast if fast else worker, tasks, chunksize=1))
               detections = [d for p in parts for d in p]
-              detections.sort(key=lambda d: (d["frame"], d["x1"]))
+              detections.sort(key=lambda d: (d["frame"], d["seg"], d["x1"]))
               log(f"[OCR] xong sau {time.time() - t_start:.0f}s, detections={len(detections)}")
               with (OUT / "ocr-raw-3fps.tsv").open("w", encoding="utf-8") as f:
-                  f.write("time\tconfidence\ttext\tx1\ty1\tx2\ty2\n")
+                  f.write("time\tconfidence\ttext\tx1\ty1\tx2\ty2\tseg\n")
                   for d in detections:
                       f.write(f"{d['time']:.3f}\t{d['score']:.3f}\t{d['text']}\t"
-                              f"{d['x1']:.1f}\t{d['y1']:.1f}\t{d['x2']:.1f}\t{d['y2']:.1f}\n")
+                              f"{d['x1']:.1f}\t{d['y1']:.1f}\t{d['x2']:.1f}\t{d['y2']:.1f}\t{d['seg']}\n")
               # Che do fast: moi detection dung chung 1 box co dinh nen khong loc tinh theo vi tri
               if not fast:
-                  detections = drop_static(detections)
-              band, _ = pick_band(detections, height)
-              frame_dets = {}
-              for d in band:
-                  frame_dets.setdefault(d["frame"], []).append(d)
+                  detections = apply_static(detections, static_info)
+              # Chi giu box nam trong dai y cua chinh doan do (loai chu canh/scene text)
+              filtered = []
+              for d in detections:
+                  s = segs[d["seg"]]
+                  m = max(12.0, .8 * s["height"])
+                  if s["cy_lo"] - m <= d["cy"] <= s["cy_hi"] + m:
+                      filtered.append(d)
+              by_frame = {}
+              for d in filtered:
+                  by_frame.setdefault(d["frame"], {}).setdefault(d["seg"], []).append(d)
               frame_lines = []
-              frame_unions = []
-              for fn, items in sorted(frame_dets.items()):
-                  items.sort(key=lambda d: (d["y1"], d["x1"]))
-                  line = "".join(d["text"] for d in items)
-                  if not line:
-                      continue
-                  frame_lines.append((fn * step, line, max(d["score"] for d in items), fn))
-                  frame_unions.append({
-                      "frame": fn, "y1": min(d["y1"] for d in items),
-                      "y2": max(d["y2"] for d in items),
-                      "cy": (min(d["y1"] for d in items) + max(d["y2"] for d in items)) / 2.0
-                  })
+              for fn, bysg in sorted(by_frame.items()):
+                  # vung chong lan giua 2 doan: lay doan co noi dung "chac" hon
+                  best = max(bysg.values(), key=lambda it: sum(x["score"] * len(x["text"]) for x in it))
+                  best = sorted(best, key=lambda d: (d["y1"], d["x1"]))
+                  line = "".join(d["text"] for d in best)
+                  if line:
+                      frame_lines.append((fn * step, line, max(d["score"] for d in best), fn))
               def comparable(a, b):
                   a = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", a)
                   b = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", b)
                   return bool(a and b and (a in b or b in a or SequenceMatcher(None, a, b).ratio() >= .68))
-              segments = []
+              cues = []
               for t, text, score, fn in frame_lines:
-                  if segments and t - segments[-1]["last"] <= step * 1.51 and comparable(segments[-1]["text"], text):
-                      seg = segments[-1]
+                  if cues and t - cues[-1]["last"] <= step * 1.51 and comparable(cues[-1]["text"], text):
+                      seg = cues[-1]
                       seg["last"] = t
                       seg["frames"] += 1
                       seg["scores"].append(score)
                       seg["variants"][text] = seg["variants"].get(text, 0) + 1
                       seg["text"] = max(seg["variants"], key=seg["variants"].get)
                   else:
-                      segments.append({"text": text, "first": t, "last": t, "frames": 1,
-                                       "scores": [score], "variants": {text: 1}})
-              segments = [x for x in segments if x["frames"] >= 2 or
-                          (sum("\u4e00" <= ch <= "\u9fff" for ch in x["text"]) >= 2 and max(x["scores"]) >= .55)]
-              def stamp(seconds):
-                  ms = max(0, round(seconds * 1000))
-                  hh, ms = divmod(ms, 3600000)
-                  mm, ms = divmod(ms, 60000)
-                  ss, ms = divmod(ms, 1000)
-                  return f"{hh:02}:{mm:02}:{ss:02},{ms:03}"
+                      cues.append({"text": text, "first": t, "last": t, "frames": 1,
+                                   "scores": [score], "variants": {text: 1}})
+              cues = [x for x in cues if x["frames"] >= 2 or
+                      (sum("\u4e00" <= ch <= "\u9fff" for ch in x["text"]) >= 2 and max(x["scores"]) >= .55)]
               srt = OUT / "hardsub-3fps.srt"
               with srt.open("w", encoding="utf-8") as f:
-                  for i, seg in enumerate(segments, 1):
+                  for i, seg in enumerate(cues, 1):
                       start = max(0, seg["first"] - step / 2)
                       end = min(duration, seg["last"] + step / 2)
                       if end > start:
                           f.write(f"{i}\n{stamp(start)} --> {stamp(end)}\n{seg['text']}\n\n")
               review_rows = []
-              for seg in segments:
+              for seg in cues:
                   mean = sum(seg["scores"]) / len(seg["scores"])
                   reasons = []
                   if mean < .85:
@@ -597,65 +819,50 @@ jobs:
                   for seg, mean, reason in review_rows:
                       f.write(f"{seg['first']:.3f}\t{seg['last']:.3f}\t{mean:.3f}\t"
                               f"{seg['frames']}\t{seg['text']}\t{reason}\n")
-              valid_geometry = False
-              geometry = {
-                  "video_width": width, "video_height": height, "duration_seconds": duration,
-                  "sample_fps": fps, "ocr_search": {"x_min": x0, "x_max": x1, "y_min": sy0, "y_max": sy1},
-                  "subtitle_center_y": None, "subtitle_height": None,
-                  "stable_detection_frames": len(frame_unions), "valid": False
-              }
-              if frame_unions:
-                  centers = [v["cy"] for v in frame_unions]
-                  heights = [v["y2"] - v["y1"] for v in frame_unions]
-                  center_y = int(round(float(np.median(centers))))
-                  text_height = int(round(float(np.percentile(heights, 90))))
-                  blur_h = max(24, int(math.ceil(text_height * BLUR_H_K / 2.0) * 2))
-                  blur_h = min(blur_h, int(height * .18) // 2 * 2)
-                  blur_w = max(2, int(width * .80) // 2 * 2)
-                  blur_x = (width - blur_w) // 2
-
-                  # Giữ tâm blur đúng tại center_y; nếu vượt đáy/đỉnh thì cắt bớt, KHÔNG dịch
-                  top = max(0, center_y - blur_h // 2)
-                  bottom = min(height, center_y + blur_h // 2)
-                  blur_y = top // 2 * 2
-                  blur_h = max(2, (bottom - blur_y) // 2 * 2)
-                  valid_geometry = (
-                      len(frame_unions) >= 3 and text_height >= max(8, int(height * .012))
-                      and text_height <= int(height * .12)
-                      and height * .35 <= center_y <= height * .98
-                  )
-                  geometry.update({
-                      "subtitle_center_y": center_y, "subtitle_height": text_height,
-                      "subtitle_center_y_ratio": round(center_y / height, 5),
-                      "blur": {"x": blur_x, "y": blur_y, "width": blur_w, "height": blur_h,
-                               "width_ratio": .80, "center_y": center_y},
-                      "blur_validated": bool(valid_geometry), "valid": bool(valid_geometry)
-                  })
+              # ---------- Geometry ----------
+              valid_geometry = bool(segs) and len(real) >= max(1, int(math.ceil(0.25 * n_win)))
+              geometry["anchors"] = len(real)
+              geometry["windows"] = n_win
+              geometry["fast_ocr"] = bool(fast)
+              geometry["subtitle_center_y"] = int(round(float(np.median([s["center_y"] for s in segs]))))
+              geometry["subtitle_height"] = int(round(float(np.median([s["height"] for s in segs]))))
+              geometry["segments"] = [{
+                  "t_start": round(s["t_start"], 3), "t_end": round(s["t_end"], 3),
+                  "center_y": int(round(s["center_y"])), "height": int(round(s["height"])),
+                  "cy_lo": int(round(s["cy_lo"])), "cy_hi": int(round(s["cy_hi"])),
+                  "anchors": s["anchors"], "blur": s["blur"]} for s in segs]
+              geometry["valid"] = bool(valid_geometry)
               Path("work/subtitle_geometry.json").write_text(
                   json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-              # Anh kiem tra hinh hoc: box OCR (xanh) + vung blur do (do)
-              if valid_geometry and frame_unions:
-                  representative = frame_unions[len(frame_unions) // 2]
-                  image = grab_frame(representative["frame"] * step, width, height)
+              with (OUT / "segments.tsv").open("w", encoding="utf-8") as f:
+                  f.write("idx\tt_start\tt_end\tcenter_y\tcy_lo\tcy_hi\theight\tblur_y\tblur_h\n")
+                  for i, s in enumerate(geometry["segments"]):
+                      f.write(f"{i}\t{s['t_start']}\t{s['t_end']}\t{s['center_y']}\t{s['cy_lo']}\t"
+                              f"{s['cy_hi']}\t{s['height']}\t{s['blur']['y']}\t{s['blur']['height']}\n")
+              # Anh kiem tra: box OCR cua 1 neo giua video (xanh) + vung blur cua doan do (do)
+              try:
+                  a = real[len(real) // 2]
+                  seg_i = max(0, min(len(segs) - 1, next(
+                      (i for i, s in enumerate(segs) if s["t_start"] <= a["t_mid"] < s["t_end"]), 0)))
+                  image = grab_frame(a["t_mid"], width, height)
                   if image is not None:
-                      for d in frame_dets.get(representative["frame"], []):
-                          cv2.rectangle(image, (int(d["x1"]), int(d["y1"])),
-                                        (int(d["x2"]), int(d["y2"])), (0, 255, 0), 2)
-                      blur = geometry["blur"]
-                      cv2.rectangle(image, (blur["x"], blur["y"]),
-                                    (blur["x"] + blur["width"], blur["y"] + blur["height"]),
-                                    (0, 0, 255), 3)
+                      for items in list(a["by"].values())[:1]:
+                          for d in items:
+                              cv2.rectangle(image, (int(d["x1"]), int(d["y1"])),
+                                            (int(d["x2"]), int(d["y2"])), (0, 255, 0), 2)
+                      bl = segs[seg_i]["blur"]
+                      cv2.rectangle(image, (bl["x"], bl["y"]),
+                                    (bl["x"] + bl["width"], bl["y"] + bl["height"]), (0, 0, 255), 3)
                       cv2.imwrite("work/subtitle-geometry-preview.jpg", image)
-              needs_review = bool(review_rows) or not valid_geometry or not segments
-              gh = os.environ.get("GITHUB_OUTPUT")
-              if gh:
-                  with open(gh, "a", encoding="utf-8") as f:
-                      f.write(f"needs_review={'true' if needs_review else 'false'}\n")
+              except Exception as e:
+                  log(f"[PREVIEW] bo qua: {e!r}")
+              needs_review = bool(review_rows) or not valid_geometry or not cues
+              write_gh_output(needs_review)
               print(f"duration={duration:.3f}s size={width}x{height} "
-                    f"ocr_detections={len(detections)} subtitle_cues={len(segments)} "
+                    f"windows={n_win} anchors={len(real)} segments={len(segs)} "
+                    f"ocr_detections={len(detections)} subtitle_cues={len(cues)} "
                     f"review_cues={len(review_rows)} geometry_valid={valid_geometry}")
-              print(json.dumps(geometry, ensure_ascii=False))
-              if not segments:
+              if not cues:
                   print("OCR produced no stable subtitle cues.")
           if __name__ == "__main__":
               main()
@@ -675,21 +882,22 @@ jobs:
           python3 <<'PY'
           import json, sys
           g = json.load(open("work/subtitle_geometry.json", encoding="utf-8"))
-          if not g.get("valid") or not g.get("blur"):
+          segs = g.get("segments") or []
+          if not g.get("valid") or not segs:
               print("::error::Không xác định được vị trí sub (geometry invalid) -> dừng sớm, khỏi tốn công dịch/TTS.")
               sys.exit(1)
-          print("Geometry OK:", g["blur"])
+          print(f"Geometry OK: {len(segs)} đoạn vị trí sub, {g.get('anchors')} điểm neo / {g.get('windows')} cửa sổ, fast={g.get('fast_ocr')}")
+          for i, s in enumerate(segs[:30]):
+              print(f"  [{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']} | blur y={s['blur']['y']} h={s['blur']['height']}")
           PY
       - name: Create static overlay detection script
         run: |
           cat > static_detect.py <<'PY'
           """
-          Phat hien lop phu CO DINH (watermark, logo, quang cao 2 ben, chu goc tren/duoi...)
-          bang cach lay 5-10 frame NGAU NHIEN (chia deu theo thoi gian, moi doan 1 frame),
-          tim cac diem canh (edge) xuat hien o >=80% so frame VA gan nhu khong doi mau,
-          chi xet 4 goc + 2 ben + dai tren/duoi.
-          MOI: neu co watermark nam trong goc (mac dinh top-left, top-right) -> che FULL goc do,
-          sat mep video (khong con mot manh nho / hai manh roi rac).
+          Phat hien lop phu CO DINH (watermark/logo) CHI O 2 GOC TREN (top-left, top-right).
+          Lay 8-16 frame NGAU NHIEN (chia deu theo thoi gian, moi doan 1 frame), tim cac diem canh
+          xuat hien o >=80% so frame VA gan nhu khong doi mau, CHI xet trong 2 goc tren.
+          Neu co watermark nam trong goc -> che FULL goc do, sat mep video.
           Ket qua: work/static_regions.json. Loi o day KHONG lam hong workflow.
           """
           import cv2, json, math, os, random, subprocess
@@ -697,17 +905,16 @@ jobs:
           from pathlib import Path
           VIDEO = "raw_video.mp4"
           WORK = Path("work")
-          W_SMALL = 640            # chieu rong anh de phan tich (nhanh)
+          W_SMALL = 800            # chieu rong anh de phan tich (nhanh nhung du chi tiet)
           EDGE_PRESENT = 0.80      # ty le frame toi thieu phai co canh tai pixel do
           STD_MAX = 10.0           # do lech chuan do sang toi da giua cac frame (de coi la tinh)
-          ZONE_TOP = 0.22          # dai tren (ty le chieu cao)
-          ZONE_BOTTOM = 0.78       # dai duoi bat dau tu day
-          ZONE_SIDE = 0.175        # dai 2 ben (ty le chieu rong)
-          MAX_REGIONS = 8
+          SCAN_X = 0.35            # chi quet 35% chieu rong tu moi mep trai/phai
+          SCAN_Y = 0.25            # va 25% chieu cao tu mep tren
+          MAX_REGIONS = 4
           # ---- Mo rong ra FULL GOC khi co watermark trong goc ----
-          CORNERS = ("tl", "tr")   # goc duoc che full. Them "bl","br" neu muon che ca goc duoi
-          CORNER_X = 0.35          # tam box nam trong 35% chieu rong tu mep -> tinh la o goc
-          CORNER_Y = 0.25          # tam box nam trong 25% chieu cao tu mep
+          CORNERS = ("tl", "tr")   # chi che 2 goc tren
+          CORNER_X = SCAN_X
+          CORNER_Y = SCAN_Y
           CORNER_MIN_W = 0.22      # vung che toi thieu (ty le chieu rong)
           CORNER_MIN_H = 0.12      # vung che toi thieu (ty le chieu cao)
           CORNER_MAX_W = 0.38      # vung che toi da
@@ -775,6 +982,21 @@ jobs:
                   log(f"[STATIC-OVERLAY] goc {key}: che full {int(x2 - x1)}x{int(y2 - y1)} (small-scale)")
                   out.append([x1, y1, x2, y2])
               return out
+          def load_sub_rects():
+              """Cac vung blur sub (da duoc lam mo roi) -> bo qua box nam gon trong do."""
+              rects = []
+              gp = WORK / "subtitle_geometry.json"
+              if gp.exists():
+                  try:
+                      geo = json.loads(gp.read_text(encoding="utf-8"))
+                      if geo.get("valid"):
+                          for s in geo.get("segments", []):
+                              b = s.get("blur")
+                              if b:
+                                  rects.append((b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"]))
+                  except Exception:
+                      pass
+              return rects
           def detect():
               if os.environ.get("STATIC_DETECT", "1") != "1":
                   log("[STATIC-OVERLAY] tat (STATIC_DETECT != 1)")
@@ -788,7 +1010,7 @@ jobs:
               cap.release()
               if width <= 0 or height <= 0 or duration < 3:
                   return []
-              n = max(5, min(10, int(duration // 15)))
+              n = max(8, min(16, int(duration // 10)))
               rng = random.Random()
               times = []
               for i in range(n):
@@ -811,7 +1033,7 @@ jobs:
                   grays.append(g.astype(np.float32))
                   edges.append(e)
               m = len(grays)
-              if m < 4:
+              if m < 5:
                   log("[STATIC-OVERLAY] khong du frame de phan tich")
                   return []
               stack = np.stack(grays)
@@ -823,11 +1045,11 @@ jobs:
               static = (count >= int(math.ceil(EDGE_PRESENT * m))) & (std < STD_MAX)
               ys = np.arange(sh)[:, None]
               xs = np.arange(W_SMALL)[None, :]
-              zone = (ys < ZONE_TOP * sh) | (ys > ZONE_BOTTOM * sh) | \
-                     (xs < ZONE_SIDE * W_SMALL) | (xs > (1 - ZONE_SIDE) * W_SMALL)
+              # CHI 2 GOC TREN: top-left + top-right
+              zone = (ys < SCAN_Y * sh) & ((xs < SCAN_X * W_SMALL) | (xs > (1 - SCAN_X) * W_SMALL))
               static &= zone
               ratio = float(static.sum()) / max(1, int(zone.sum()))
-              log(f"[STATIC-OVERLAY] pixel tinh trong vung bien: {ratio * 100:.2f}%")
+              log(f"[STATIC-OVERLAY] pixel tinh trong 2 goc tren: {ratio * 100:.2f}%")
               if ratio > 0.25:
                   log("[STATIC-OVERLAY] ty le tinh qua cao (canh quay co dinh?) -> bo qua")
                   return []
@@ -854,14 +1076,7 @@ jobs:
               boxes = merge_boxes(boxes, gap=int(W_SMALL * 0.04))
               boxes = expand_corners(boxes, W_SMALL, sh)
               boxes = merge_boxes(boxes, gap=2)
-              # vung blur sub (da duoc lam mo roi) -> bo qua box nam gon trong do
-              sub_rect = None
-              gp = WORK / "subtitle_geometry.json"
-              if gp.exists():
-                  geo = json.loads(gp.read_text(encoding="utf-8"))
-                  b = geo.get("blur")
-                  if geo.get("valid") and b:
-                      sub_rect = (b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"])
+              sub_rects = load_sub_rects()
               inv = 1.0 / scale
               regions = []
               for b in boxes:
@@ -875,12 +1090,16 @@ jobs:
                   h = (y2 - y1) // 2 * 2
                   if w < 16 or h < 12:
                       continue
-                  if sub_rect:
-                      ix = max(0, min(x1 + w, sub_rect[2]) - max(x1, sub_rect[0]))
-                      iy = max(0, min(y1 + h, sub_rect[3]) - max(y1, sub_rect[1]))
+                  skip = False
+                  for sr in sub_rects:
+                      ix = max(0, min(x1 + w, sr[2]) - max(x1, sr[0]))
+                      iy = max(0, min(y1 + h, sr[3]) - max(y1, sr[1]))
                       if ix * iy >= 0.6 * w * h:
                           log(f"[STATIC-OVERLAY] bo qua vung ({x1},{y1},{w},{h}): nam trong vung blur sub")
-                          continue
+                          skip = True
+                          break
+                  if skip:
+                      continue
                   # feather = [trai, phai, tren, duoi]; 0 = canh sat mep video -> KHONG feather
                   tol = 6
                   feather = [int(x1 > tol), int(x1 + w < width - tol),
@@ -913,9 +1132,9 @@ jobs:
           if __name__ == "__main__":
               main()
           PY
-      - name: Detect static overlays (corners / sides / watermark)
+      - name: Detect static overlays (top-left / top-right watermark)
         env:
-          STATIC_DETECT: "1"   # 1 = bật, 0 = tắt phần che watermark/quảng cáo cố định
+          STATIC_DETECT: "1"   # 1 = bật, 0 = tắt phần che watermark cố định
         run: |
           set -euo pipefail
           python3 static_detect.py
@@ -1733,7 +1952,7 @@ jobs:
       # ============================================================
       # ĐÓNG GÓI 1 FILE ZIP + UPLOAD LÊN PIXELDRAIN -> lấy ID
       # Zip chứa: raw_video.mp4, mixed_audio.m4a, vietnamese.srt/.vtt,
-      #           subtitle_geometry.json, static_regions.json
+      #           subtitle_geometry.json (dạng segments), static_regions.json
       # (dùng zip -0: chỉ đóng gói, không nén lại vì mp4/m4a đã nén sẵn)
       # ============================================================
       - name: Pack results and upload to Pixeldrain
