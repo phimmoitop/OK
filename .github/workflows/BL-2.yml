@@ -203,7 +203,7 @@ jobs:
           feather_y = max(3, int(round(blur_h * .09)))
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
-          FONT_SCALE = 1.25
+          FONT_SCALE = 1.35
           font_size = max(50, int(sub_h * .90 * FONT_SCALE))
           font_size = min(font_size, max(50, int(width * .80 / max(1, max_chars * .50))))
           ass = [
