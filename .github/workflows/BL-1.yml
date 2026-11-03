@@ -425,6 +425,7 @@ jobs:
               n = 80
               rng = random.Random(12345)
               pos, neg, junk = [], 0, 0
+              junk_txt = []
               for i in range(n):
                   t = duration * (i + rng.random()) / n
                   image = grab_frame(t, width, height)
@@ -446,11 +447,15 @@ jobs:
                       neg += 1
                       if rec_ok:
                           junk += 1
+                          junk_txt.append((round(t, 1), txt, round(sc, 2)))
               mean = float(np.mean(pos)) if pos else 0.0
-              junk_rate = junk / float(max(1, neg))
-              ok = len(pos) >= 8 and mean >= 0.75 and junk_rate <= 0.20
+              # Ti le rac tinh tren TONG so mau (frame trong rat it o video thoai day -> khong chia cho neg)
+              junk_rate = junk / float(max(1, len(pos) + neg))
+              ok = len(pos) >= 8 and mean >= 0.75 and junk_rate <= 0.10
               log(f"[FAST-CHECK] co sub: {len(pos)} mau, khop TB {mean:.2f} | khong sub: {neg} mau, rac {junk} "
-                  f"({junk_rate * 100:.0f}%) -> {'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
+                  f"({junk_rate * 100:.1f}% tong mau) -> {'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
+              for jt in junk_txt[:6]:
+                  log(f"[FAST-CHECK]   rac? t={jt[0]}s diem={jt[2]} text={jt[1]!r}")
               return ok
           # ------------------------------------------------------------
           # DO NHI PHAN DIEM DOI VI TRI GIUA 2 NEO
