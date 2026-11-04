@@ -1,4 +1,4 @@
-name: "[2/3] RAW → OCR → SUB"
+name: "[2/3] RAW → SUB"
 
 on:
   workflow_dispatch:
