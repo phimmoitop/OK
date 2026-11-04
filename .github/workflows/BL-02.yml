@@ -37,9 +37,10 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$PD_LINK" =~ ^https://(www\.)?pixeldrain\.(com|net|dev)/(u|api/file)/([A-Za-z0-9_-]+) ]] || { echo '::error::link phải là link Pixeldrain dạng https://pixeldrain.com/u/<id>'; exit 1; }
-          echo "PD_ID=${BASH_REMATCH[4]}" >> "$GITHUB_ENV"
+          ID="${BASH_REMATCH[4]}"
           [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
-          echo "Pixeldrain ID = ${BASH_REMATCH[4]}"
+          echo "PD_ID=$ID" >> "$GITHUB_ENV"
+          echo "Pixeldrain ID = $ID"
 
       - name: Setup Python
         uses: actions/setup-python@v6
