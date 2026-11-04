@@ -1,4 +1,4 @@
-name: "[3/3] Pixeldrain (SUB + RAW) → Render Vietsub + HLS → Cloudflare Pages"
+name: "[3/3] RAW + SUB → HLS"
 
 on:
   workflow_dispatch:
