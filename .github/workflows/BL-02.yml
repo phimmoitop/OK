@@ -1,4 +1,4 @@
-name: "[2/3] Pixeldrain RAW → OCR + Dịch + TTS Mix → Pixeldrain (SUB)"
+name: "[2/3] RAW → OCR → SUB"
 
 on:
   workflow_dispatch:
