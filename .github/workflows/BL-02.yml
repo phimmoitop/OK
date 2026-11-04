@@ -1859,13 +1859,9 @@ jobs:
                   t_req = time.time()
                   with LOCK:
                       INFLIGHT[i] = (ki, attempt, t_req)
-                  log(f"c{i} GUI key#{ki + 1} lan {attempt}/{MAX_RETRIES} | {len(text)} ky tu, "
-                      f"{n_words(text)} tu | {text[:60]!r}")
                   try:
                       r = requests.post(API_URL, json=payload, headers=make_headers(key), timeout=TIMEOUT)
                       el = time.time() - t_req
-                      log(f"c{i} NHAN key#{ki + 1} lan {attempt} | HTTP {r.status_code} | "
-                          f"{el:.1f}s | {len(r.content) / 1024:.1f} KB")
                       if r.status_code in (429, 500, 502, 503, 504):
                           stat(ki, False, el)
                           last = f"HTTP {r.status_code} (key #{ki + 1})"
@@ -1892,7 +1888,6 @@ jobs:
                           rr = requests.get(data["audio_url"], timeout=90, allow_redirects=False)
                           rr.raise_for_status()
                           audio = rr.content
-                          log(f"c{i} tai audio_url mat {time.time() - t_dl:.1f}s")
                       if not audio:
                           stat(ki, False, el)
                           raise RuntimeError("API khong tra ve du lieu MP3")
