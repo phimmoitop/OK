@@ -1740,7 +1740,7 @@ jobs:
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"
           TTS_SPEEDUP: "1.0"
-          TTS_WORKERS: "9"
+          TTS_WORKERS: "6"
           TTS_MAX_RETRIES: "3"
           TTS_TIMEOUT: "200"
           TTS_HEARTBEAT: "30"
