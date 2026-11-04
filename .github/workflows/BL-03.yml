@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "SUBID-SUB-RAWID  (vd: sT1sbAuW-SUB-htUT5prY). ID trước = file SUB.zip (bước 2), ID sau = file RAW (bước 1)"
+        description: "SUBID-SUB-RAWID"
         required: true
         type: string
       slug:
