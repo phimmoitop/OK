@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "https://pixeldrain.com/u/xxxxxxxx (link video RAW trên Pixeldrain)"
+        description: "Pixeldrain"
         required: true
         type: string
       slug:
@@ -1739,7 +1739,7 @@ jobs:
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"
           TTS_SPEEDUP: "1.0"
-          TTS_WORKERS: "15"
+          TTS_WORKERS: "9"
           TTS_MAX_RETRIES: "3"
           TTS_TIMEOUT: "200"
           TTS_HEARTBEAT: "30"
