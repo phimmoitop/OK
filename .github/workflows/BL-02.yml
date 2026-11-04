@@ -1740,7 +1740,7 @@ jobs:
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"
           TTS_SPEEDUP: "1.0"
-          TTS_WORKERS: "1"
+          TTS_WORKERS: "3"
           TTS_MAX_RETRIES: "10"
           TTS_TIMEOUT: "200"
           TTS_HEARTBEAT: "30"
@@ -1962,7 +1962,6 @@ jobs:
                       done += 1
                       if ok:
                           made += 1
-                          log(f"c{i} XONG OK | tong {took:.1f}s | audio {dur:.2f}s | [{done}/{len(jobs)}]")
                       else:
                           failed.append((i, text))
                           log(f"c{i} THAT BAI -> bo qua | tong {took:.1f}s | {msg} | [{done}/{len(jobs)}]")
