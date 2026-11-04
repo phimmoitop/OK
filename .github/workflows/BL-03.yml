@@ -1,4 +1,4 @@
-name: "[3/3] RAW + SUB → HLS"
+name: "[3/3] SUB → HLS"
 
 on:
   workflow_dispatch:
