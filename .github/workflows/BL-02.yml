@@ -1741,7 +1741,7 @@ jobs:
           REVID_RATE: "0%"
           TTS_SPEEDUP: "1.0"
           TTS_WORKERS: "6"
-          TTS_MAX_RETRIES: "3"
+          TTS_MAX_RETRIES: "10"
           TTS_TIMEOUT: "200"
           TTS_HEARTBEAT: "30"
           TTS_ERROR_RATIO: "0.1"
