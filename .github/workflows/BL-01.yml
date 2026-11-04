@@ -1,0 +1,238 @@
+name: "[1/2] Bilibili → Download → Pixeldrain (RAW)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: "https://www.bilibili.com/video/BV1YZJb6RELN"
+        required: true
+        type: string
+      slug:
+        description: "slug"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PYTHONUNBUFFERED: "1"
+      LC_ALL: "C.UTF-8"
+      LANG: "C.UTF-8"
+      SLUG: ${{ inputs.slug }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          VIDEO_URL: ${{ inputs.link }}
+        run: |
+          [[ "$VIDEO_URL" =~ ^https?://([[:alnum:]-]+\.)?bilibili\.com/video/BV[0-9A-Za-z]+ ]] || { echo '::error::url must be a Bilibili video URL'; exit 1; }
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-dl-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            pip-dl-${{ runner.os }}-
+
+      - name: Install yt-dlp
+        run: |
+          set -eux
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade yt-dlp
+
+      # ============================================================
+      # SMOKE TEST: PIXELDRAIN API KEY. Lỗi thì dừng ngay.
+      # ============================================================
+      - name: Test Pixeldrain API key (smoke test, stop early if it fails)
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
+          code=$(curl -s -o /tmp/pd_user.json -w "%{http_code}" --retry 3 --retry-all-errors \
+            -u ":$PD_KEY" "https://pixeldrain.com/api/user" || true)
+          echo "HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::Pixeldrain API key sai / không truy cập được: $(head -c 300 /tmp/pd_user.json 2>/dev/null)"; exit 1; }
+          can_upload=$(jq -r '.can_upload // true' /tmp/pd_user.json)
+          echo "Pixeldrain user: $(jq -r '.username' /tmp/pd_user.json) | can_upload=$can_upload"
+          [ "$can_upload" != "false" ] || { echo '::error::Tài khoản Pixeldrain chưa được phép upload (cần xác minh email)'; exit 1; }
+
+      - name: Prepare directories
+        run: |
+          set -eux
+          mkdir -p work
+
+      - name: Prepare Bilibili cookies (inline Python)
+        env:
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os, re
+          from pathlib import Path
+          raw = os.environ.get("BILIBILI_COOKIES", "").strip()
+          if not raw:
+              raise SystemExit("Missing GitHub secret BILIBILI_COOKIES")
+          out = Path("work/cookies.txt")
+          if raw.startswith("# Netscape HTTP Cookie File") or raw.startswith("# HTTP Cookie File"):
+              out.write_text(raw + ("\n" if not raw.endswith("\n") else ""), encoding="utf-8")
+          else:
+              pairs = []
+              for item in raw.split(";"):
+                  item = item.strip()
+                  if "=" not in item:
+                      continue
+                  name, value = item.split("=", 1)
+                  name, value = name.strip(), value.strip()
+                  if re.fullmatch(r"[A-Za-z0-9_]+", name) and value:
+                      pairs.append((name, value))
+              if not pairs:
+                  raise SystemExit("BILIBILI_COOKIES is neither a Netscape file nor a Cookie header")
+              with out.open("w", encoding="utf-8") as f:
+                  f.write("# Netscape HTTP Cookie File\n")
+                  for name, value in pairs:
+                      f.write(f".bilibili.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
+          os.chmod(out, 0o600)
+          print("Cookie file prepared (values hidden).")
+          PY
+
+      - name: Download Bilibili video
+        timeout-minutes: 180
+        env:
+          VIDEO_URL: ${{ inputs.link }}
+          MAX_ATTEMPTS: "40"
+        run: |
+          set -uo pipefail
+          BILIBILI_URL="$VIDEO_URL"
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+          COMMON=(
+            --cookies work/cookies.txt --no-playlist
+            --continue --no-overwrites
+            --extractor-retries 3 --fragment-retries 5 --retries 3 --socket-timeout 30
+            --throttled-rate 200K --extractor-retries 10
+            --add-header "User-Agent: $UA"
+            --add-header "Referer: https://www.bilibili.com/"
+            --add-header "Origin: https://www.bilibili.com"
+            -f "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+            -S "res,codec:avc1:h264,ext:mp4:m4a"
+            --merge-output-format mp4
+            -o "raw_video.mp4"
+          )
+          show_status() {
+            echo "--- Trạng thái file đã tải ---"
+            ls -lh raw_video* 2>/dev/null || echo "(chưa có file nào)"
+            echo "------------------------------"
+          }
+          # Kiểm tra file cuối có hợp lệ không (không bị cụt / hỏng)
+          valid_video() {
+            [ -s raw_video.mp4 ] || return 1
+            d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4 2>/dev/null)
+            [ -n "$d" ] && [ "$d" != "N/A" ]
+          }
+          ok=0
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "=== attempt $attempt/$MAX_ATTEMPTS: yt-dlp native (resume) ==="
+            show_status
+            if yt-dlp "${COMMON[@]}" "$BILIBILI_URL"; then
+              if valid_video; then
+                ok=1; break
+              fi
+              echo "::warning::File ghép xong nhưng không hợp lệ, xóa file ghép và thử lại."
+              rm -f raw_video.mp4
+            fi
+            echo "::warning::Attempt $attempt thất bại, giữ lại phần đã tải để tải tiếp."
+            [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep $(( attempt * 8 > 60 ? 60 : attempt * 8 ))
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Khong tai duoc video Bilibili sau $MAX_ATTEMPTS lan thu (CDN tu choi IP runner)."
+            show_status
+            exit 1
+          fi
+          ls -lh raw_video.mp4
+          echo "duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4)"
+
+      # ============================================================
+      # UPLOAD LÊN PIXELDRAIN với tên {slug}-RAW.mp4 -> lấy ID
+      # ============================================================
+      - name: Upload RAW video to Pixeldrain
+        id: pixel
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
+          NAME="${SLUG}-RAW.mp4"
+          SIZE=$(stat -c %s raw_video.mp4)
+          echo "FILE: $NAME = $((SIZE / 1048576)) MB"
+          ID=""
+          MAX=6
+          for attempt in $(seq 1 "$MAX"); do
+            echo "[UP] Pixeldrain attempt $attempt/$MAX"
+            rm -f work/pd_upload.json
+            code=$(curl -sS -T raw_video.mp4 -u ":$PD_KEY" \
+              -o work/pd_upload.json -w "%{http_code}" \
+              "https://pixeldrain.com/api/file/${NAME}" || true)
+            echo "HTTP $code: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
+            if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+              ID=$(jq -r '.id // empty' work/pd_upload.json)
+              [ -n "$ID" ] && break
+            fi
+            case "$code" in
+              401|403|413|422)
+                echo "::error::Pixeldrain từ chối (HTTP $code), không thử lại: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
+                exit 1 ;;
+            esac
+            [ "$attempt" -lt "$MAX" ] && sleep $(( attempt * 10 ))
+          done
+          [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử'; exit 1; }
+          # Kiểm tra lại: size trên Pixeldrain phải khớp file local
+          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://pixeldrain.com/api/file/${ID}/info")
+          remote_size=$(jq -r '.size' <<<"$info")
+          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)"
+          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local'; exit 1; }
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Link: https://pixeldrain.com/u/${ID}"
+
+      - name: Notify VPS (type=raw)
+        env:
+          PIXEL_ID: ${{ steps.pixel.outputs.id }}
+        run: |
+          set -euo pipefail
+          [ -n "$PIXEL_ID" ] || { echo '::error::Không có Pixeldrain ID'; exit 1; }
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            -G "https://cp.ssplay.net/vicdn.php" \
+            --data-urlencode "type=raw" \
+            --data-urlencode "slug=${SLUG}" \
+            --data-urlencode "pixel=${PIXEL_ID}"
+          echo
+          echo "Đã báo type=raw cho VPS (slug=${SLUG}, pixel=${PIXEL_ID})."
+
+      - name: Cleanup cookies
+        if: always()
+        run: |
+          rm -f work/cookies.txt
+          echo "Cookie removed."
