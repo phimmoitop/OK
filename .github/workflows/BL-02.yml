@@ -1261,7 +1261,8 @@ jobs:
           cat > translate_native.py <<'PY'
           """
           Doc sub goc (work/native.srt, tieng Trung) -> DON SACH sub Trung (gop cue trung/gan giong,
-          bo rac) -> dich sang tieng Viet bang Gemini -> rut gon cau qua dai.
+          bo rac) -> dich sang tieng Viet bang Gemini (gioi han ky tu ngay trong prompt).
+          Dong sot / con chu Han KHONG retry ngay, gom lai het roi dich lai 1 luot o cuoi.
           Dong AI tra "..." (rac OCR khong doc duoc) = BO TRONG, KHONG BAO GIO giu lai tieng Trung.
           Ket qua: work/vi_raw.json (start, end, text, vi). Buoc finalize_vi.py se lam sach hoan toan.
           """
@@ -1276,7 +1277,6 @@ jobs:
           MIN_CUE_DURATION = 0.10
           ZH_MERGE_GAP = 1.5
           ZH_MERGE_SIM = 0.55
-          MAX_SYL_PER_SEC = 6.0
           CJK_RE = re.compile(r"[\u2e80-\u2fdf\u3000-\u30ff\u3100-\u31ff\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
           # ---- GEMINI ----
           GEMINI_MODELS = [
@@ -1287,6 +1287,7 @@ jobs:
           ]
           GEMINI_BATCH_SIZE = 200
           GEMINI_MAX_RETRIES = 10
+          MAX_CHARS_PER_LINE = 60   # gioi han so ky tu (tinh ca dau cach) cho moi dong tieng Viet
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
           SYSTEM_INSTRUCTION = (
@@ -1310,7 +1311,9 @@ jobs:
               "intended meaning. If a line is so corrupted that you cannot recover a sensible meaning, output '...' for it.\n"
               "9. CONCISENESS (VERY IMPORTANT): Make every Vietnamese line SHORT, concise and easy to understand at a "
               "glance. Use simple, everyday spoken Vietnamese. Cut filler words, repeated phrases and unnecessary "
-              "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain.\n"
+              "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain. "
+              f"HARD LIMIT: every Vietnamese line MUST be at most {MAX_CHARS_PER_LINE} characters long (spaces included). "
+              "If the source line is long, compress the meaning to fit the limit instead of exceeding it.\n"
               "10. The output must be PURE VIETNAMESE. NEVER output Chinese characters, pinyin or any other language."
           )
           def log(msg):
@@ -1437,8 +1440,8 @@ jobs:
                           pass
               return pairs
           def parse_batch(response_text, n):
-              """Ghep theo SO THU TU AI ghi. Dong sot -> KHONG co trong dict (de retry).
-              Dong AI chu dong tra '...' -> co trong dict voi gia tri '' (= bo trong, KHONG retry)."""
+              """Ghep theo SO THU TU AI ghi. Dong sot -> KHONG co trong dict (se dich lai o cuoi).
+              Dong AI chu dong tra '...' -> co trong dict voi gia tri '' (= bo trong, KHONG dich lai)."""
               pairs = parse_pairs(response_text)
               out = {}
               in_range = sum(1 for i, _ in pairs if 0 <= i < n)
@@ -1469,8 +1472,9 @@ jobs:
               total = len(cues)
               total_batches = (total + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
               log(f"BAT DAU DICH - {total} dong / {total_batches} batch")
+              # vi = None nghia la CHUA DICH DUOC (sot hoac con chu Han) -> se dich lai 1 luot o cuoi
               results = []
-              n_blank = 0
+              # ---------- LUOT 1: dich tung batch, KHONG retry dong sot ----------
               for i in range(0, total, GEMINI_BATCH_SIZE):
                   batch = cues[i:i + GEMINI_BATCH_SIZE]
                   bn = i // GEMINI_BATCH_SIZE + 1
@@ -1486,71 +1490,48 @@ jobs:
                   for line in response_text.strip().split("\n"):
                       log(f"   {line}")
                   translated = parse_batch(response_text, len(batch))
-                  redo = [idx for idx in range(len(batch))
-                          if idx not in translated or has_cjk(translated.get(idx, ""))]
-                  if redo:
-                      log(f">> Retry {len(redo)} dong bi sot/con chu Han: {redo}")
-                      rp = "Translate ONLY these lines into pure Vietnamese (no Chinese characters). Use '...' if unreadable:\n\n"
-                      rp += "".join(f"[{idx}] {batch[idx]['text'].strip() or '...'}\n" for idx in redo)
-                      rp += "\nOutput ONLY these lines with their exact [index] prefix."
-                      rr = call_gemini_with_retry(rp)
-                      if rr:
-                          log(">> KET QUA RETRY:")
-                          for line in rr.strip().split("\n"):
-                              log(f"   {line}")
-                          for k, v in parse_translated(rr).items():
-                              if k in redo and not has_cjk(v):
-                                  translated[k] = v
+                  n_miss = 0
                   for idx, cue in enumerate(batch):
-                      vi = translated.get(idx, "")
-                      if not vi.strip():
-                          vi = ""
-                          n_blank += 1
-                          log(f"   [{i + idx + 1:04d}] BO TRONG: {cue['text']!r}")
+                      vi = translated.get(idx)
+                      if vi is None or has_cjk(vi):
+                          vi = None
+                          n_miss += 1
                       results.append({"start": cue["start"], "end": cue["end"],
                                       "text": cue["text"], "vi": vi})
-                  log(f"[BATCH {bn}/{total_batches}] Hoan thanh")
+                  log(f"[BATCH {bn}/{total_batches}] Hoan thanh | {n_miss} dong sot/con chu Han (se dich lai o cuoi)")
                   time.sleep(3)
-              log(f">> Tong cong {n_blank}/{total} dong bo trong (rac OCR / khong doc duoc)")
+              # ---------- LUOT 2: gom TAT CA dong sot, dich lai 1 luot ----------
+              missing = [i for i, r in enumerate(results) if r["vi"] is None]
+              log(f">> TONG KET LUOT 1: {len(missing)}/{total} dong sot -> dich lai 1 luot")
+              for k in range(0, len(missing), GEMINI_BATCH_SIZE):
+                  part = missing[k:k + GEMINI_BATCH_SIZE]
+                  rp = "Translate ONLY these lines into pure Vietnamese (no Chinese characters). Use '...' if unreadable:\n\n"
+                  rp += "".join(f"[{i}] {results[i]['text'].strip() or '...'}\n" for i in part)
+                  rp += "\nOutput ONLY these lines with their exact [index] prefix."
+                  rr = call_gemini_with_retry(rp)
+                  if not rr:
+                      log(">> LUOT 2: khong nhan duoc ket qua cho nhom nay")
+                      continue
+                  log(">> KET QUA DICH LAI:")
+                  for line in rr.strip().split("\n"):
+                      log(f"   {line}")
+                  allowed = set(part)
+                  for i, v in parse_translated(rr).items():
+                      if i in allowed and not has_cjk(v):
+                          results[i]["vi"] = v
+                  time.sleep(3)
+              # ---------- Dong van con sot sau luot 2 -> BO TRONG ----------
+              n_still = 0
+              for i, r in enumerate(results):
+                  if r["vi"] is None:
+                      r["vi"] = ""
+                      n_still += 1
+                      log(f"   [{i + 1:04d}] VAN SOT sau luot 2 -> BO TRONG: {r['text']!r}")
+              n_blank = sum(1 for r in results if not r["vi"].strip())
+              log(f">> Tong cong {n_blank}/{total} dong bo trong ({n_still} dong van sot, con lai la rac OCR AI tra '...')")
               return results
           def count_syl(t):
               return len(re.findall(r"\w+", t, re.UNICODE))
-          def shorten_long(results):
-              for _round in range(2):
-                  todo = []
-                  for i, r in enumerate(results):
-                      if not r["vi"].strip():
-                          continue
-                      nxt = results[i + 1]["start"] if i + 1 < len(results) else r["end"] + 2
-                      budget = min(max(nxt - r["start"], 0.8), 10.0)
-                      limit = max(2, int(budget * MAX_SYL_PER_SEC))
-                      if count_syl(r["vi"]) > limit:
-                          todo.append((i, limit))
-                  log(f">> SHORTEN round {_round + 1}: {len(todo)} dong qua dai")
-                  if not todo:
-                      break
-                  for k in range(0, len(todo), 100):
-                      part = todo[k:k + 100]
-                      prompt = (
-                          "Rewrite each Vietnamese subtitle line to be SHORTER so it can be spoken within the time limit. "
-                          "Keep the core meaning, keep the same speaker relationship and pronouns (or drop pronouns if unsure), "
-                          "keep it natural and fluent, and drop filler words. Each line is formatted as [index|max_words] text. "
-                          "Your output for each line MUST be at most max_words words. "
-                          "Output ONLY '[index] shortened text' lines. Do NOT output the max_words number. Pure Vietnamese only.\n\n"
-                          + "".join(f"[{i}|{lim}] {results[i]['vi']}\n" for i, lim in part)
-                      )
-                      resp = call_gemini_with_retry(prompt)
-                      if not resp:
-                          continue
-                      log(">> KET QUA RUT GON:")
-                      for line in resp.strip().split("\n"):
-                          log(f"   {line}")
-                      allowed = {i for i, _ in part}
-                      for i, txt in parse_translated(resp).items():
-                          if i in allowed and txt and not has_cjk(txt):
-                              results[i]["vi"] = txt
-                      time.sleep(2)
-              return results
           def write_debug(results):
               with open(WORK / "translation_debug.txt", "w", encoding="utf-8") as f:
                   for idx, r in enumerate(results):
@@ -1558,7 +1539,7 @@ jobs:
                       dur = r["end"] - r["start"]
                       f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s ({dur:.2f}s)\n")
                       f.write(f"  ZH ({zh}): {r['text']}\n")
-                      f.write(f"  VI ({vi}, {count_syl(r['vi'])} tu): {r['vi']}\n\n")
+                      f.write(f"  VI ({vi} ky tu, {count_syl(r['vi'])} tu): {r['vi']}\n\n")
           def main():
               cues = load_native_cues()
               cues = clean_zh_cues(cues)
@@ -1569,7 +1550,6 @@ jobs:
               for i, c in enumerate(cues, 1):
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
               translated = translate_cues(cues)
-              translated = shorten_long(translated)
               write_debug(translated)
               (WORK / "vi_raw.json").write_text(json.dumps(translated, ensure_ascii=False, indent=1), encoding="utf-8")
               log("TRANSLATE COMPLETE -> work/vi_raw.json (chua hoan thien, chay finalize_vi.py)")
