@@ -1283,10 +1283,8 @@ jobs:
           CJK_RE = re.compile(r"[\u2e80-\u2fdf\u3000-\u30ff\u3100-\u31ff\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
           # ---- GEMINI ----
           GEMINI_MODELS = [
-              "gemini-3.5-flash-lite",
               "gemini-3.1-flash-lite",
               "gemini-3.6-flash",
-              "gemini-3.8-flash",
           ]
           GEMINI_BATCH_SIZE = 200
           GEMINI_MAX_RETRIES = 10     # dung cho loi limit (429) va loi khac (404/400/401/403)
