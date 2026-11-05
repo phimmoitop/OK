@@ -2020,7 +2020,7 @@ jobs:
           BG_OUT = 0.8               # tiếng gốc khi KHÔNG có thoại
           BG_IN = BG_RATIO
           BG_GAIN_MAX = 4.0
-          DELAY_MS = 0
+          DELAY_MS = 300
           GAP_MS = 60
           MAX_DRIFT_MS = 1500
           LOOKAHEAD_MS = 400
