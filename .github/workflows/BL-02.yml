@@ -1279,8 +1279,13 @@ jobs:
           MAX_SYL_PER_SEC = 6.0
           CJK_RE = re.compile(r"[\u2e80-\u2fdf\u3000-\u30ff\u3100-\u31ff\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
           # ---- GEMINI ----
-          GEMINI_MODEL = "gemini-3.5-flash-lite"
-          GEMINI_BATCH_SIZE = 150
+          GEMINI_MODELS = [
+              "gemini-3.5-flash-lite",
+              "gemini-3.1-flash-lite",
+              "gemini-3.6-flash",
+              "gemini-3.8-flash",
+          ]
+          GEMINI_BATCH_SIZE = 200
           GEMINI_MAX_RETRIES = 10
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
@@ -1379,29 +1384,30 @@ jobs:
               return out
           def get_random_gemini_client():
               key = random.choice(GEMINI_API_KEYS)
-              return genai.Client(api_key=key), key
+              model = random.choice(GEMINI_MODELS)
+              return genai.Client(api_key=key), key, model
           def call_gemini_with_retry(prompt_text, max_retries=GEMINI_MAX_RETRIES):
               for attempt in range(max_retries):
                   wait = 6 * (2 ** attempt)
-                  client, key = get_random_gemini_client()
-                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Key #{GEMINI_API_KEYS.index(key) + 1} | {time.strftime('%H:%M:%S')}")
+                  client, key, model = get_random_gemini_client()
+                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Model {model} | Key #{GEMINI_API_KEYS.index(key) + 1} | {time.strftime('%H:%M:%S')}")
                   try:
                       t0 = time.time()
                       response = client.models.generate_content(
-                          model=GEMINI_MODEL,
+                          model=model,
                           contents=prompt_text,
                           config=types.GenerateContentConfig(
                               system_instruction=SYSTEM_INSTRUCTION,
                               temperature=0.3,
                           )
                       )
-                      log(f"<< NHAN KET QUA - Thanh cong sau {time.time() - t0:.1f}s")
+                      log(f"<< NHAN KET QUA ({model}) - Thanh cong sau {time.time() - t0:.1f}s")
                       return response.text
                   except Exception as e:
                       err = str(e)
-                      log(f"<< LOI API: {err}")
+                      log(f"<< LOI API ({model}): {err}")
                       if any(c in err for c in ("503", "429", "500", "UNAVAILABLE")):
-                          log(f"   Server ban/qua tai/limit. Doi key va cho {wait}s...")
+                          log(f"   Server ban/qua tai/limit. Doi model/key khac va cho {wait}s...")
                           time.sleep(wait)
                       else:
                           log("   Loi khong the retry. Dung thu lai.")
