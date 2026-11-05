@@ -1262,6 +1262,9 @@ jobs:
           """
           Doc sub goc (work/native.srt, tieng Trung) -> DON SACH sub Trung (gop cue trung/gan giong,
           bo rac) -> dich sang tieng Viet bang Gemini (gioi han ky tu ngay trong prompt).
+          Moi lan goi API random 1 model + 1 key.
+          Loi server (500/503/504/timeout): retry toi da 20 lan, moi lan cach 90s.
+          Loi limit (429): doi model/key, cho 90s.
           Dong sot / con chu Han KHONG retry ngay, gom lai het roi dich lai 1 luot o cuoi.
           Dong AI tra "..." (rac OCR khong doc duoc) = BO TRONG, KHONG BAO GIO giu lai tieng Trung.
           Ket qua: work/vi_raw.json (start, end, text, vi). Buoc finalize_vi.py se lam sach hoan toan.
@@ -1286,8 +1289,11 @@ jobs:
               "gemini-3.8-flash",
           ]
           GEMINI_BATCH_SIZE = 200
-          GEMINI_MAX_RETRIES = 10
-          MAX_CHARS_PER_LINE = 60   # gioi han so ky tu (tinh ca dau cach) cho moi dong tieng Viet
+          GEMINI_MAX_RETRIES = 10     # dung cho loi limit (429) va loi khac (404/400/401/403)
+          SERVER_MAX_RETRIES = 20     # dung cho loi server (500/503/504/timeout)
+          SERVER_RETRY_WAIT = 90      # giay cho giua 2 lan retry khi loi server
+          LIMIT_RETRY_WAIT = 90       # giay cho giua 2 lan retry khi loi limit (429)
+          MAX_CHARS_PER_LINE = 60     # gioi han so ky tu (tinh ca dau cach) cho moi dong tieng Viet
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
           SYSTEM_INSTRUCTION = (
@@ -1389,13 +1395,47 @@ jobs:
               key = random.choice(GEMINI_API_KEYS)
               model = random.choice(GEMINI_MODELS)
               return genai.Client(api_key=key), key, model
-          def call_gemini_with_retry(prompt_text, max_retries=GEMINI_MAX_RETRIES):
-              for attempt in range(max_retries):
-                  wait = 6 * (2 ** attempt)
+          def classify_error(e):
+              """Tra ve (nhan, kind). kind: 'server' | 'limit' | 'fatal'."""
+              msg = str(e)
+              code = getattr(e, "code", None)
+              if code is None:
+                  m = re.search(r"\b([45]\d\d)\b", msg)
+                  code = int(m.group(1)) if m else None
+              low = msg.lower()
+              if code == 429 or "RESOURCE_EXHAUSTED" in msg:
+                  if "perday" in low or "per day" in low:
+                      return "LIMIT HET QUOTA NGAY (429)", "limit"
+                  if "perminute" in low or "per minute" in low:
+                      return "LIMIT THEO PHUT (429) - RPM/TPM cua project", "limit"
+                  return "LIMIT (429) - vuot han muc cua project/model", "limit"
+              if code == 503 or "UNAVAILABLE" in msg:
+                  return "SERVER QUA TAI (503) - phia Google, KHONG phai limit cua ban", "server"
+              if code == 500 or "INTERNAL" in msg:
+                  return "SERVER LOI NOI BO (500) - phia Google", "server"
+              if code == 504 or "DEADLINE_EXCEEDED" in msg:
+                  return "SERVER TIMEOUT (504) - phia Google", "server"
+              if any(w in low for w in ("timed out", "timeout", "connection", "disconnected", "reset by peer")):
+                  return "LOI MANG / TIMEOUT - coi nhu loi server", "server"
+              if code == 404:
+                  return "MODEL KHONG TON TAI (404) - kiem tra lai ten model", "fatal"
+              if code in (401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
+                  return f"KEY SAI/KHONG CO QUYEN ({code})", "fatal"
+              if code == 400:
+                  return "REQUEST SAI (400)", "fatal"
+              return f"LOI KHAC ({code})", "fatal"
+          def call_gemini_with_retry(prompt_text):
+              server_fails = 0
+              other_fails = 0
+              attempt = 0
+              while True:
+                  attempt += 1
                   client, key, model = get_random_gemini_client()
-                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Model {model} | Key #{GEMINI_API_KEYS.index(key) + 1} | {time.strftime('%H:%M:%S')}")
+                  kno = GEMINI_API_KEYS.index(key) + 1
+                  log(f">> GUI GEMINI - Lan {attempt} (loi server {server_fails}/{SERVER_MAX_RETRIES}, "
+                      f"loi khac {other_fails}/{GEMINI_MAX_RETRIES}) | Model {model} | Key #{kno} | {time.strftime('%H:%M:%S')}")
+                  t0 = time.time()
                   try:
-                      t0 = time.time()
                       response = client.models.generate_content(
                           model=model,
                           contents=prompt_text,
@@ -1407,15 +1447,29 @@ jobs:
                       log(f"<< NHAN KET QUA ({model}) - Thanh cong sau {time.time() - t0:.1f}s")
                       return response.text
                   except Exception as e:
-                      err = str(e)
-                      log(f"<< LOI API ({model}): {err}")
-                      if any(c in err for c in ("503", "429", "500", "UNAVAILABLE")):
-                          log(f"   Server ban/qua tai/limit. Doi model/key khac va cho {wait}s...")
-                          time.sleep(wait)
+                      label, kind = classify_error(e)
+                      log(f"<< LOI [{label}] | Model {model} | Key #{kno} | sau {time.time() - t0:.1f}s")
+                      log(f"   Chi tiet: {str(e)[:300]}")
+                      if kind == "server":
+                          server_fails += 1
+                          if server_fails >= SERVER_MAX_RETRIES:
+                              log(f"   Het {SERVER_MAX_RETRIES} lan retry loi server. Bo cuoc.")
+                              return None
+                          log(f"   Loi server, thu lai lan {server_fails + 1}/{SERVER_MAX_RETRIES} sau {SERVER_RETRY_WAIT}s (model/key random lai)...")
+                          time.sleep(SERVER_RETRY_WAIT)
+                      elif kind == "limit":
+                          other_fails += 1
+                          if other_fails >= GEMINI_MAX_RETRIES:
+                              log(f"   Het {GEMINI_MAX_RETRIES} lan retry loi limit/khac. Bo cuoc.")
+                              return None
+                          log(f"   Limit, doi model/key khac va cho {LIMIT_RETRY_WAIT}s...")
+                          time.sleep(LIMIT_RETRY_WAIT)
                       else:
-                          log("   Loi khong the retry. Dung thu lai.")
-                          break
-              return None
+                          other_fails += 1
+                          if other_fails >= GEMINI_MAX_RETRIES:
+                              log(f"   Het {GEMINI_MAX_RETRIES} lan retry loi khac. Bo cuoc.")
+                              return None
+                          log("   Loi khong the cho de khac phuc. Doi model/key khac thu lai ngay.")
           def parse_translated(response_text):
               out = {}
               for line in response_text.strip().split("\n"):
