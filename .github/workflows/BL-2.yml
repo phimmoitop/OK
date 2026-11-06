@@ -1,26 +1,14 @@
-name: "[2/2] Pixeldrain → Render Vietsub + HLS → Cloudflare Pages"
+name: "NEW [2/3] SUB → TTS"
 
 on:
   workflow_dispatch:
     inputs:
       link:
-        description: "Link Pixeldrain"
+        description: "SUB ID"
         required: true
         type: string
       slug:
         description: "slug"
-        required: true
-        type: string
-      token:
-        description: "token"
-        required: true
-        type: string
-      page:
-        description: "page"
-        required: true
-        type: string
-      account:
-        description: "account"
         required: true
         type: string
 
@@ -28,450 +16,428 @@ permissions:
   contents: read
 
 jobs:
-  render:
+  tts:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: "1"
       LC_ALL: "C.UTF-8"
       LANG: "C.UTF-8"
-      # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
-      X264_PRESET: "slow"
-      X264_CRF: "23"
       SLUG: ${{ inputs.slug }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - name: Validate inputs
-        env:
-          PIXEL_LINK: ${{ inputs.link }}
-        run: |
-          [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
-          # link phải dạng https://pixeldrain.com/u/ID -> tách ID
-          if [[ "$PIXEL_LINK" =~ ^https://pixeldrain\.com/u/([A-Za-z0-9_-]+)/?$ ]]; then
-            echo "PIXEL_ID=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
-            echo "Pixeldrain ID: ${BASH_REMATCH[1]}"
-          else
-            echo '::error::link phải có dạng https://pixeldrain.com/u/ID'
-            exit 1
-          fi
+      # Không checkout (không dùng file nào trong repo), không apt-get, không ffmpeg.
+      # Chỉ dùng curl/jq/zip/unzip có sẵn trên ubuntu-latest + 4 gói pip nhỏ.
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install system packages
+      - name: Install Python packages (pip only, no apt)
         run: |
           set -eux
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg jq fonts-noto-core fontconfig unzip
-          # Cài font Oswald từ file zip có sẵn trong repo (bỏ variable font, chỉ dùng static)
-          sudo mkdir -p /usr/local/share/fonts/oswald
-          sudo unzip -o -j Oswald.zip '*.ttf' -x '*VariableFont*' -d /usr/local/share/fonts/oswald
-          sudo fc-cache -f
-          fc-list | grep -i oswald || { echo '::error::Không cài được font Oswald'; exit 1; }
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-render-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            pip-render-${{ runner.os }}-
-      - name: Install Python packages
-        run: |
-          set -eux
-          python -m pip install --upgrade pip
-          python -m pip install \
-            opencv-python-headless \
-            pysubs2 \
-            numpy \
-            requests
-          python3 <<'PY'
-          import cv2, pysubs2, numpy, requests
-          print("ALL IMPORTS OK")
-          PY
-      - name: Prepare directories
-        run: |
-          set -eux
-          mkdir -p work output dl
-      # ============================================================
-      # TẢI FILE ZIP TỪ PIXELDRAIN (tải ẩn danh, resume + kiểm tra sha256) -> GIẢI NÉN
-      # ============================================================
-      - name: Download zip from Pixeldrain and extract
-        timeout-minutes: 120
+          python -m pip install --disable-pip-version-check webvtt-py av numpy requests
+          python3 -c "import av, webvtt, numpy, requests; print('ALL IMPORTS OK')"
+
+      # Validate input + smoke test Pixeldrain key: lỗi thì dừng ngay, trước khi tốn tiền TTS
+      - name: Validate inputs + Pixeldrain smoke test
+        env:
+          LINK: ${{ inputs.link }}
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
+          for c in curl jq zip unzip; do
+            command -v "$c" >/dev/null || { echo "::error::Runner thiếu '$c' (thêm: sudo apt-get install -y $c)"; exit 1; }
+          done
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
+          SUB_ID="$(echo -n "$LINK" | tr -d '[:space:]')"
+          [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo '::error::link phải là ID Pixeldrain của {slug}-SUB.zip (bước 1)'; exit 1; }
+          echo "SUB_ID=$SUB_ID" >> "$GITHUB_ENV"
+          echo "SUB zip = $SUB_ID"
+          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
+          code=$(curl -s -o /tmp/pd_user.json -w "%{http_code}" --retry 3 --retry-all-errors \
+            -u ":$PD_KEY" "https://pixeldrain.com/api/user" || true)
+          echo "HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::Pixeldrain API key sai / không truy cập được: $(head -c 300 /tmp/pd_user.json 2>/dev/null)"; exit 1; }
+          can_upload=$(jq -r '.can_upload // true' /tmp/pd_user.json)
+          echo "Pixeldrain user: $(jq -r '.username' /tmp/pd_user.json) | can_upload=$can_upload"
+          [ "$can_upload" != "false" ] || { echo '::error::Tài khoản Pixeldrain chưa được phép upload (cần xác minh email)'; exit 1; }
+          mkdir -p work chunks dl
 
-          DL_URL="https://pixeldrain.com/api/file/${PIXEL_ID}?download"
-          INFO_URL="https://pixeldrain.com/api/file/${PIXEL_ID}/info"
+      # ============================================================
+      # TẢI {slug}-SUB.zip -> chỉ lấy vietnamese.vtt (cho TTS)
+      # ============================================================
+      - name: Download SUB zip from Pixeldrain and extract
+        timeout-minutes: 60
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          AUTH=()
+          [ -n "${PD_KEY:-}" ] && AUTH=(-u ":$PD_KEY")
 
-          # Lấy thông tin file (size + sha256) để kiểm tra sau khi tải
-          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "$INFO_URL" || true)
+          DL_URL="https://pixeldrain.com/api/file/${SUB_ID}?download"
+          INFO_URL="https://pixeldrain.com/api/file/${SUB_ID}/info"
+
+          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "${AUTH[@]}" "$INFO_URL" || true)
+          [ -n "$info" ] || { echo "::error::Không lấy được thông tin file SUB '$SUB_ID' (sai ID / file đã bị xóa?)"; exit 1; }
           want=$(jq -r '.hash_sha256 // empty' <<<"$info" 2>/dev/null || true)
           size=$(jq -r '.size // 0' <<<"$info" 2>/dev/null || echo 0)
-          avail=$(jq -r '.availability // empty' <<<"$info" 2>/dev/null || true)
-          echo "[INFO] id=$PIXEL_ID size=$((size / 1048576)) MB sha256=${want:-?} availability=${avail:-ok}"
-          if [ -n "$avail" ]; then
-            echo "::warning::Pixeldrain báo file bị hạn chế: $avail (có thể cần captcha / bị giới hạn tải)"
-          fi
+          echo "[SUB] id=$SUB_ID name=$(jq -r '.name' <<<"$info") size=$((size / 1024)) KB sha256=${want:-?}"
 
           is_ok() {
-            [ -s pixel.zip ] || return 1
+            [ -s sub.zip ] || return 1
             if [ -n "$want" ]; then
-              [ "$(sha256sum pixel.zip | cut -d' ' -f1)" = "$want" ]
+              [ "$(sha256sum sub.zip | cut -d' ' -f1)" = "$want" ]
             else
-              unzip -tq pixel.zip >/dev/null 2>&1
+              unzip -tq sub.zip >/dev/null 2>&1
             fi
           }
 
           ok=0
           for attempt in $(seq 1 10); do
             if is_ok; then ok=1; break; fi
-            # Đã đủ dung lượng mà vẫn sai hash/hỏng -> xóa tải lại từ đầu
-            if [ -f pixel.zip ] && [ "$size" -gt 0 ] && [ "$(stat -c %s pixel.zip)" -ge "$size" ]; then
-              echo "::warning::pixel.zip đủ dung lượng nhưng sai, tải lại từ đầu."
-              rm -f pixel.zip
+            if [ -f sub.zip ] && [ "$size" -gt 0 ] && [ "$(stat -c %s sub.zip)" -ge "$size" ]; then
+              echo "::warning::sub.zip đủ dung lượng nhưng sai, tải lại từ đầu."
+              rm -f sub.zip
             fi
-            echo "[GET] attempt $attempt/10"
-            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - \
-              "$DL_URL" -o pixel.zip \
+            echo "[GET SUB] attempt $attempt/10"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
+              "$DL_URL" -o sub.zip \
               || echo "::warning::curl lỗi lần $attempt, thử tiếp (resume)."
             sleep 3
           done
           if [ "$ok" -ne 1 ] && is_ok; then ok=1; fi
-          if [ "$ok" -ne 1 ]; then
-            echo "::error::Không tải được file Pixeldrain '$PIXEL_ID' hợp lệ sau 10 lần thử (kiểm tra link / giới hạn tải của Pixeldrain)."
-            exit 1
-          fi
-          echo "[OK] pixel.zip hợp lệ"
-          ls -lh pixel.zip
+          [ "$ok" -eq 1 ] || { echo "::error::Không tải được file SUB '$SUB_ID' hợp lệ sau 10 lần thử."; exit 1; }
+          echo "[OK] sub.zip hợp lệ"
 
-          # Giải nén
-          unzip -o -q pixel.zip -d dl
-          for f in raw_video.mp4 mixed_audio.m4a vietnamese.srt vietnamese.vtt subtitle_geometry.json static_regions.json; do
-            [ -s "dl/$f" ] || { echo "::error::Trong zip thiếu file '$f'"; exit 1; }
-          done
-          mv dl/raw_video.mp4 raw_video.mp4
-          mv dl/mixed_audio.m4a dl/vietnamese.srt dl/vietnamese.vtt \
-             dl/subtitle_geometry.json dl/static_regions.json work/
-          rm -rf dl pixel.zip
+          # Bước 2 chỉ cần vietnamese.vtt (không đụng raw.txt / video RAW)
+          unzip -o -q sub.zip vietnamese.vtt -d dl || { echo "::error::SUB zip thiếu vietnamese.vtt (có chắc ID là {slug}-SUB.zip của bước 1?)"; exit 1; }
+          [ -s dl/vietnamese.vtt ] || { echo '::error::vietnamese.vtt rỗng'; exit 1; }
+          mv dl/vietnamese.vtt work/
+          rm -rf dl sub.zip
+          ls -lh work/
 
-          ls -lh raw_video.mp4 work/
-      - name: Validate downloaded media
-        run: |
-          set -euo pipefail
-          V=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4)
-          A=$(ffprobe -v error -show_entries format=duration -of csv=p=0 work/mixed_audio.m4a)
-          echo "video=${V}s | mixed_audio=${A}s"
-          python3 - "$V" "$A" <<'PY'
-          import sys
-          v, a = float(sys.argv[1]), float(sys.argv[2])
-          if v <= 0 or a <= 0:
-              print("::error::Duration không hợp lệ")
-              sys.exit(1)
-          if abs(v - a) > 10:
-              print(f"::error::Audio lệch {abs(v - a):.1f}s so với video, file có thể hỏng.")
-              sys.exit(1)
-          PY
-      # ============================================================
-      # RENDER: blur sub gốc THEO ĐOẠN VỊ TRÍ + che watermark + burn sub Việt + ghép audio mix sẵn
-      #   - Các đoạn có vị trí sub gần giống nhau được gộp thành 1 "level" blur
-      #     (thường chỉ 1-4 level) -> mỗi level 1 nhánh crop+gblur, bật/tắt bằng enable=between(t,..)
-      #   - Sub Việt đặt đúng y của đoạn chứa nó
-      # ============================================================
-      - name: Render Vietnamese video and HLS with per-segment subtitle blur
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          import json, math, re, subprocess
-          from bisect import bisect_right
-          from pathlib import Path
-          import cv2
-          import numpy as np
-          import pysubs2
-          geo = json.loads(Path("work/subtitle_geometry.json").read_text(encoding="utf-8"))
-          segs = sorted(geo.get("segments") or [], key=lambda s: s["t_start"])
-          if not geo.get("valid") or not segs:
-              raise SystemExit("Subtitle geometry was not validated; refusing to render.")
-          width, height = int(geo["video_width"]), int(geo["video_height"])
-          duration = float(geo["duration_seconds"])
-          sub_h = int(geo["subtitle_height"])
-          center_x = width // 2
-          sigma = max(24, int(round(sub_h * .80)))
-          PAD = 1.0          # mỗi đoạn blur rộng thêm +-1s quanh ranh giới đổi vị trí
-          MAX_LEVELS = 6     # tối đa số nhánh blur (càng ít càng render nhanh)
-          seg_starts = [s["t_start"] for s in segs]
-          def seg_at(ms):
-              i = bisect_right(seg_starts, ms / 1000.0) - 1
-              return segs[max(0, min(i, len(segs) - 1))]
-          # ------------------------------------------------------------
-          # Gom các đoạn có vùng blur gần giống nhau thành "level"
-          # ------------------------------------------------------------
-          def union(a, b):
-              return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
-          def close(a, b):
-              h = max(a[3] - a[1], b[3] - b[1])
-              tol = max(6, int(.25 * h))
-              return abs(a[1] - b[1]) <= tol and abs(a[3] - b[3]) <= tol
-          levels = []
-          for si, s in enumerate(segs):
-              b = s["blur"]
-              rect = [int(b["x"]), int(b["y"]), int(b["x"] + b["width"]), int(b["y"] + b["height"])]
-              a_t = 0.0 if si == 0 else max(0.0, s["t_start"] - PAD)
-              e_t = duration + 10.0 if si == len(segs) - 1 else s["t_end"] + PAD
-              for lv in levels:
-                  if close(lv["rect"], rect):
-                      lv["rect"] = union(lv["rect"], rect)
-                      lv["iv"].append((a_t, e_t))
-                      break
-              else:
-                  levels.append({"rect": rect, "iv": [(a_t, e_t)]})
-          while len(levels) > MAX_LEVELS:
-              best = None
-              for i in range(len(levels)):
-                  for j in range(i + 1, len(levels)):
-                      ci = (levels[i]["rect"][1] + levels[i]["rect"][3]) / 2.0
-                      cj = (levels[j]["rect"][1] + levels[j]["rect"][3]) / 2.0
-                      d = abs(ci - cj)
-                      if best is None or d < best[0]:
-                          best = (d, i, j)
-              _, i, j = best
-              levels[i]["rect"] = union(levels[i]["rect"], levels[j]["rect"])
-              levels[i]["iv"] += levels[j]["iv"]
-              del levels[j]
-          def merge_iv(iv):
-              iv = sorted(iv)
-              out = [list(iv[0])]
-              for a, b in iv[1:]:
-                  if a <= out[-1][1] + 0.01:
-                      out[-1][1] = max(out[-1][1], b)
-                  else:
-                      out.append([a, b])
-              return [(a, b) for a, b in out]
-          clean_levels = []
-          for lv in levels:
-              x1, y1, x2, y2 = lv["rect"]
-              x1, y1 = max(0, x1) // 2 * 2, max(0, y1) // 2 * 2
-              x2, y2 = min(width, x2), min(height, y2)
-              w, h = (x2 - x1) // 2 * 2, (y2 - y1) // 2 * 2
-              if w < 16 or h < 8:
-                  continue
-              clean_levels.append({"x": x1, "y": y1, "w": w, "h": h, "iv": merge_iv(lv["iv"])})
-          levels = clean_levels
-          if not levels:
-              raise SystemExit("No valid blur level; refusing to render.")
-          def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
-              """Mat na alpha feather. sides = (trai, phai, tren, duoi); 0 = canh do KHONG feather
-              (dung cho canh sat mep video de dai sat mep van duoc lam mo 100%)."""
-              fx, fy = float(max(1, fx)), float(max(1, fy))
-              xs = np.arange(w, dtype=np.float32)[None, :]
-              ys = np.arange(h, dtype=np.float32)[:, None]
-              big = np.float32(1e6)
-              l = xs / fx if sides[0] else big
-              r = (w - 1 - xs) / fx if sides[1] else big
-              t = ys / fy if sides[2] else big
-              b = (h - 1 - ys) / fy if sides[3] else big
-              alpha = np.clip(np.minimum(np.minimum(l, r), np.minimum(t, b)), 0.0, 1.0)
-              alpha = np.broadcast_to(alpha, (h, w))
-              cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
-          for old in Path("work").glob("blur_mask_*.png"):
-              old.unlink()
-          for k, lv in enumerate(levels):
-              fx = max(8, int(round(lv["h"] * .27)))
-              fy = max(3, int(round(lv["h"] * .09)))
-              feather_mask(lv["w"], lv["h"], fx, fy, f"work/blur_mask_{k}.png")
-          def enable_expr(iv):
-              if len(iv) == 1 and iv[0][0] <= 0.01 and iv[0][1] >= duration:
-                  return ""
-              return ":enable='" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in iv) + "'"
-          # ------------------------------------------------------------
-          # Phụ đề Việt (ASS): đặt theo y của đoạn chứa dòng sub
-          # ------------------------------------------------------------
-          vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
-          max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
-          FONT_SCALE = 1.35
-          font_size = max(50, int(sub_h * .90 * FONT_SCALE))
-          font_size = min(font_size, max(50, int(width * .80 / max(1, max_chars * .50))))
-          ass = [
-              "[Script Info]", "Title: Vietnamese hard subtitles",
-              "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}",
-              "WrapStyle: 2", "ScaledBorderAndShadow: yes", "",
-              "[V4+ Styles]",
-              "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-              f"Style: Default,Oswald,{font_size},&H0000FFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,0,1",
-              "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
-          ]
-          def ass_time(ms):
-              total = max(0, int(ms))
-              h, total = divmod(total, 3600000)
-              m, total = divmod(total, 60000)
-              sec, total = divmod(total, 1000)
-              return f"{h}:{m:02}:{sec:02}.{total // 10:02}"
-          for ev in vi.events:
-              text = ev.text.replace("\\N", "\\N").replace("\n", "\\N")
-              text = text.replace("{", "\\{").replace("}", "\\}")
-              cy = int(seg_at((ev.start + ev.end) / 2.0)["center_y"])
-              ass.append(
-                  f"Dialogue: 0,{ass_time(ev.start)},{ass_time(ev.end)},Default,,0,0,0,,"
-                  f"{{\\an5\\pos({center_x},{cy})}}{text}"
-              )
-          Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
-          # ---- Vùng che cố định (watermark 2 góc trên) từ bước static_detect ----
-          regions = []
-          sp = Path("work/static_regions.json")
-          if sp.exists():
-              try:
-                  regions = json.loads(sp.read_text(encoding="utf-8")).get("regions", [])
-              except Exception:
-                  regions = []
-          clean = []
-          for r in regions:
-              x, y, w, h = int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])
-              x -= x % 2; y -= y % 2
-              w = min(w, width - x) // 2 * 2
-              h = min(h, height - y) // 2 * 2
-              if w >= 16 and h >= 12:
-                  clean.append((x, y, w, h, r.get("feather", [1, 1, 1, 1])))
-          regions = clean
-          for old in Path("work").glob("static_mask_*.png"):
-              old.unlink()
-          for k, (x, y, w, h, fs) in enumerate(regions):
-              fx = max(4, int(round(min(w, h) * .18)))
-              feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png", sides=fs)
-          # Input: 0 = raw_video.mp4, 1 = work/mixed_audio.m4a,
-          #        2..(1+L) = work/blur_mask_k.png (lặp, mỗi level 1 mask),
-          #        (2+L).. = work/static_mask_k.png (lặp)
-          L = len(levels)
-          n_split = 1 + L + len(regions)
-          graph = ["[0:v]split=%d[vbase]" % n_split
-                   + "".join(f"[lv{k}]" for k in range(L))
-                   + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
-          cur = "vbase"
-          for k, (x, y, w, h, fs) in enumerate(regions):
-              sg = max(10, min(60, int(round(h * .60))))
-              graph.append(
-                  f"[sp{k}]crop={w}:{h}:{x}:{y},gblur=sigma={sg},format=rgb24[sb{k}];"
-                  f"[{2 + L + k}:v]format=gray[sm{k}];"
-                  f"[sb{k}][sm{k}]alphamerge[sq{k}];"
-                  f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
-              )
-              cur = f"sv{k}"
-          for k, lv in enumerate(levels):
-              graph.append(
-                  f"[lv{k}]crop={lv['w']}:{lv['h']}:{lv['x']}:{lv['y']},"
-                  f"gblur=sigma={sigma},format=rgb24[lb{k}];"
-                  f"[{2 + k}:v]format=gray[lm{k}];"
-                  f"[lb{k}][lm{k}]alphamerge[lq{k}];"
-                  f"[{cur}][lq{k}]overlay=x={lv['x']}:y={lv['y']}:shortest=1{enable_expr(lv['iv'])}[lo{k}];"
-              )
-              cur = f"lo{k}"
-          graph.append(f"[{cur}]subtitles=work/vietnamese-overlay.ass[v]")
-          video_graph = "".join(graph)
-          Path("work/render-filter.txt").write_text(video_graph + "\n", encoding="utf-8")
-          print(f"Subtitle segments: {len(segs)} | blur levels: {L} (sigma={sigma})")
-          for i, s in enumerate(segs[:40]):
-              print(f"  seg[{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s center_y={s['center_y']}")
-          for k, lv in enumerate(levels):
-              span = ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in lv["iv"][:8])
-              print(f"  level[{k}] x={lv['x']} y={lv['y']} w={lv['w']} h={lv['h']} | {len(lv['iv'])} khoang: {span}")
-          print(f"Static overlay blur regions: {len(regions)}")
-          for k, (x, y, w, h, fs) in enumerate(regions):
-              print(f"  [{k}] x={x} y={y} w={w} h={h} feather(l,r,t,b)={fs}")
-          print(f"Vietnamese overlay: font={font_size}px, y theo từng đoạn.")
-          PY
-          DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
-          # Thứ tự input mask phải khớp filter graph: blur_mask_0..L-1 trước, rồi static_mask_0..
-          EXTRA=()
-          for m in $(ls work/blur_mask_*.png 2>/dev/null | sort -V) $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
-            EXTRA+=(-loop 1 -framerate 30 -t "$DUR" -i "$m")
-          done
-          ffmpeg -y -i raw_video.mp4 -i work/mixed_audio.m4a \
-            "${EXTRA[@]}" \
-            -filter_complex_script work/render-filter.txt \
-            -map "[v]" -map 1:a:0 \
-            -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
-            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -pix_fmt yuv420p \
-            -c:a copy \
-            -t "$DUR" final.mp4
-          mkdir -p output
-          ffmpeg -y -i final.mp4 -c copy -f hls \
-            -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
-            -hls_segment_type fmp4 \
-            -hls_fmp4_init_filename "${{ inputs.slug }}-index.png" \
-            -hls_segment_filename "output/${{ inputs.slug }}-index%d.png" \
-            "output/${{ inputs.slug }}.m3u8"
-      - name: Copy subtitle file into output folder
-        run: |
-          set -eux
-          cp work/vietnamese.vtt "output/${{ inputs.slug }}.vtt"
-          ls -lh output/
-      - name: Deploy to Cloudflare Pages (first)
-        id: deploy1
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ github.event.inputs.token }}
-          accountId: ${{ github.event.inputs.account }}
-          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
-
-      - name: Verify Cloudflare deployment (branch domain check)
-        id: verify
-        continue-on-error: true
+      - name: TTS Generation (Revid TTS API + Vietnamese VTT)
         env:
-          PROJECT: ${{ github.event.inputs.page }}
-          BRANCH: ${{ github.event.inputs.slug }}
+          REVID_API_KEYS: ${{ secrets.REVID_API_KEYS }}   # mỗi dòng 1 key
+          REVID_VOICE_ID: "3001"
+          REVID_LANGUAGE: "vi-VN"
+          REVID_RATE: "0%"
+          TTS_WORKERS: "4"
+          TTS_MAX_RETRIES: "10"
+          TTS_TIMEOUT: "200"
+          TTS_HEARTBEAT: "30"
+          TTS_ERROR_RATIO: "0.1"
         run: |
-          set -e
-          FILE_URL="https://${{ github.event.inputs.slug }}.${{ github.event.inputs.page }}.pages.dev/${{ github.event.inputs.slug }}.m3u8"
+          python3 <<'PY'
+          import io, os, re, sys, time, base64, logging, random, threading, unicodedata
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.parse import urlparse
+          import av
+          import numpy as np
+          import requests
+          import webvtt
+          logging.basicConfig(level=logging.INFO, format="%(message)s")
+          API_URL = "https://tts.revidapi.com/api/v1/tts"
+          API_KEYS = []
+          for k in os.environ.get("REVID_API_KEYS", "").splitlines():
+              k = k.strip()
+              if k and k not in API_KEYS:
+                  API_KEYS.append(k)
+          VOICE_ID = int(os.environ.get("REVID_VOICE_ID", "3001"))
+          LANGUAGE = os.environ.get("REVID_LANGUAGE", "vi-VN")
+          RATE = os.environ.get("REVID_RATE", "0%")
+          WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "2")))
+          MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
+          TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "100"))
+          HEARTBEAT = float(os.environ.get("TTS_HEARTBEAT", "20"))
+          ERROR_RATIO = float(os.environ.get("TTS_ERROR_RATIO", "0.1"))
+          T0 = time.time()
+          LOCK = threading.Lock()
+          INFLIGHT = {}
+          KEY_STATS = {}
+          def log(msg):
+              with LOCK:
+                  print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)
+          def stat(ki, ok, sec):
+              with LOCK:
+                  s = KEY_STATS.setdefault(ki, {"n": 0, "ok": 0, "err": 0, "sec": 0.0})
+                  s["n"] += 1
+                  s["ok" if ok else "err"] += 1
+                  s["sec"] += sec
+          def heartbeat(stop):
+              while not stop.wait(HEARTBEAT):
+                  with LOCK:
+                      items = sorted(INFLIGHT.items())
+                  now = time.time()
+                  if items:
+                      desc = " | ".join(f"c{i}: key#{ki + 1} lan{att} cho {now - t:.0f}s"
+                                        for i, (ki, att, t) in items)
+                      log(f"[HEARTBEAT] dang cho: {desc}")
+                  else:
+                      log("[HEARTBEAT] khong co request nao dang cho")
+          def pick_key(avoid=None):
+              idxs = list(range(len(API_KEYS)))
+              if avoid is not None and len(idxs) > 1:
+                  idxs = [i for i in idxs if i != avoid]
+              i = random.choice(idxs)
+              return i, API_KEYS[i]
+          def make_headers(key):
+              return {
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "x-api-key": key,
+                  "x-revidapi-client": "tts-studio",
+              }
+          def normalize_for_tts(text):
+              text = unicodedata.normalize("NFKC", text)
+              text = re.sub(r"\{[^}]*\}", " ", text)
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = text.replace("\\N", " ").replace("\\n", " ")
+              text = re.sub(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff]", " ", text)
+              text = re.sub(r"[‘’´`]", "'", text)
+              text = re.sub(r"[–—―]", "-", text)
+              text = text.lower()
+              text = re.sub(r"\b([a-zà-ỹđ])-\1", r"\1", text)
+              text = re.sub(r"[^\w\s,.!?;:'%-]|_", " ", text)
+              text = re.sub(r"\.{2,}", ".", text)
+              text = re.sub(r"([,;:!?])\1+", r"\1", text)
+              text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+              text = re.sub(r"([,;:!?])(?=\S)", r"\1 ", text)
+              text = re.sub(r"\.(?=[^\W\d_])", ". ", text)
+              text = re.sub(r"\s+", " ", text).strip(" ,.;:-'")
+              if not re.search(r"\w", text):
+                  return ""
+              if not text.endswith((".", "!", "?")):
+                  text += "."
+              return text
+          def n_words(text):
+              return len(re.findall(r"\w+", text, re.UNICODE))
+          def decode_mp3(mp3_bytes, sr=24000):
+              """Giai ma MP3 -> float32 mono bang PyAV."""
+              c = av.open(io.BytesIO(mp3_bytes))
+              rs = av.AudioResampler(format="flt", layout="mono", rate=sr)
+              parts = []
+              def take(x):
+                  if x is None:
+                      return
+                  for f in (x if isinstance(x, list) else [x]):
+                      parts.append(f.to_ndarray().reshape(-1))
+              for frame in c.decode(audio=0):
+                  take(rs.resample(frame))
+              take(rs.resample(None))
+              c.close()
+              a = np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, np.float32)
+              return a, sr
+          def plausible(a, sr, text):
+              if a.size == 0 or not np.isfinite(a).all():
+                  return False
+              if float(np.abs(a).max()) < 0.01:
+                  return False
+              dur = len(a) / float(sr)
+              w = max(1, n_words(text))
+              return max(0.15, 0.08 * w) <= dur <= 0.9 * w + 2.5
+          def fetch_mp3(i, text):
+              payload = {
+                  "text": text,
+                  "voice_id": VOICE_ID,
+                  "language": LANGUAGE,
+                  "rate": RATE,
+                  "return_base64": True,
+              }
+              last = "unknown"
+              bad_key = None
+              for attempt in range(1, MAX_RETRIES + 1):
+                  ki, key = pick_key(avoid=bad_key)
+                  t_req = time.time()
+                  with LOCK:
+                      INFLIGHT[i] = (ki, attempt, t_req)
+                  try:
+                      r = requests.post(API_URL, json=payload, headers=make_headers(key), timeout=TIMEOUT)
+                      el = time.time() - t_req
+                      if r.status_code in (429, 500, 502, 503, 504):
+                          stat(ki, False, el)
+                          last = f"HTTP {r.status_code} (key #{ki + 1})"
+                          bad_key = ki
+                          log(f"c{i} LOI TAM THOI {last} | body: {r.text[:200]!r} | cho {3 * attempt}s roi thu lai")
+                          time.sleep(3 * attempt)
+                          continue
+                      data = r.json()
+                      if r.status_code != 200 or not data.get("success"):
+                          stat(ki, False, el)
+                          raise RuntimeError(f"API loi HTTP {r.status_code} (key #{ki + 1}): "
+                                             f"{data.get('error')} | {str(data)[:200]}")
+                      audio = None
+                      b64 = data.get("audio_base64")
+                      if b64:
+                          if b64.startswith("data:"):
+                              b64 = b64.split(",", 1)[1]
+                          audio = base64.b64decode(b64)
+                      if not audio and data.get("audio_url"):
+                          u = urlparse(data["audio_url"])
+                          if u.scheme != "https" or (u.hostname or "").lower() != "tts.revidapi.com":
+                              raise RuntimeError("audio_url khong hop le")
+                          t_dl = time.time()
+                          rr = requests.get(data["audio_url"], timeout=90, allow_redirects=False)
+                          rr.raise_for_status()
+                          audio = rr.content
+                      if not audio:
+                          stat(ki, False, el)
+                          raise RuntimeError("API khong tra ve du lieu MP3")
+                      stat(ki, True, el)
+                      return audio
+                  except (requests.RequestException, ValueError) as e:
+                      el = time.time() - t_req
+                      stat(ki, False, el)
+                      last = f"{e!r} (key #{ki + 1})"
+                      bad_key = ki
+                      log(f"c{i} LOI MANG/JSON key#{ki + 1} lan {attempt} sau {el:.1f}s: {e!r} | "
+                          f"cho {3 * attempt}s roi thu lai")
+                      time.sleep(3 * attempt)
+                  finally:
+                      with LOCK:
+                          INFLIGHT.pop(i, None)
+              raise RuntimeError(f"het {MAX_RETRIES} lan thu: {last}")
+          def save_mp3(mp3_bytes, out):
+              with open(out, "wb") as f:
+                  f.write(mp3_bytes)
+              if os.path.getsize(out) == 0:
+                  raise RuntimeError("Empty mp3")
+          def process(i, text):
+              out = f"chunks/c_{i}.mp3"
+              t_all = time.time()
+              try:
+                  mp3 = fetch_mp3(i, text)
+                  a, sr = decode_mp3(mp3)
+                  dur = len(a) / float(sr)
+                  if not plausible(a, sr, text):
+                      return i, text, False, f"bat thuong (dur={dur:.2f}s, {n_words(text)} tu)", time.time() - t_all, dur
+                  save_mp3(mp3, out)
+                  return i, text, True, "", time.time() - t_all, dur
+              except Exception as e:
+                  if os.path.exists(out):
+                      os.remove(out)
+                  return i, text, False, str(e), time.time() - t_all, 0.0
+          def main():
+              if not API_KEYS:
+                  print("Missing GitHub secret REVID_API_KEYS"); sys.exit(1)
+              vtt_path = "work/vietnamese.vtt"
+              if not os.path.exists(vtt_path):
+                  print(f"Missing {vtt_path}"); sys.exit(1)
+              vtt = webvtt.read(vtt_path)
+              os.makedirs("chunks", exist_ok=True)
+              total = len(vtt)
+              log(f"[Revid] keys={len(API_KEYS)} | voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
+                  f"workers={WORKERS} | timeout={TIMEOUT:.0f}s | cues={total}")
+              jobs = []
+              for i, c in enumerate(vtt):
+                  text = normalize_for_tts(c.text)
+                  if not text or text == ".":
+                      continue
+                  jobs.append((i, text))
+              ERROR_THRESHOLD = max(1, int(len(jobs) * ERROR_RATIO))
+              log(f"[Revid] jobs={len(jobs)} | Dung neu loi >= {ERROR_THRESHOLD}/{len(jobs)} doan")
+              failed = []
+              made = 0
+              done = 0
+              stop = threading.Event()
+              threading.Thread(target=heartbeat, args=(stop,), daemon=True).start()
+              with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                  futs = [ex.submit(process, i, t) for i, t in jobs]
+                  for fut in as_completed(futs):
+                      i, text, ok, msg, took, dur = fut.result()
+                      done += 1
+                      if ok:
+                          made += 1
+                      else:
+                          failed.append((i, text))
+                          log(f"c{i} THAT BAI -> bo qua | tong {took:.1f}s | {msg} | [{done}/{len(jobs)}]")
+                      if done % 5 == 0 or done == len(jobs):
+                          el = time.time() - T0
+                          rate = done / el * 60 if el > 0 else 0
+                          eta = (len(jobs) - done) / (done / el) / 60 if done else 0
+                          log(f"[TIEN DO] {done}/{len(jobs)} | ok={made} | loi={len(failed)} | "
+                              f"{rate:.1f} cau/phut | con lai ~{eta:.0f} phut")
+              stop.set()
+              log("[THONG KE THEO KEY]")
+              for ki in sorted(KEY_STATS):
+                  s = KEY_STATS[ki]
+                  avg = s["sec"] / s["n"] if s["n"] else 0
+                  log(f"  key#{ki + 1}: {s['n']} request | ok={s['ok']} loi={s['err']} | trung binh {avg:.1f}s/request")
+              failed.sort()
+              failed_count = len(failed)
+              print(f"Tổng số đoạn lỗi: {failed_count}")
+              for i, t in failed:
+                  print(f"  - doan {i}: {t!r}")
+              if failed_count > ERROR_THRESHOLD:
+                  print(f"Phát hiện {failed_count} đoạn lỗi (vượt ngưỡng {ERROR_THRESHOLD}). Dừng Workflow!")
+                  sys.exit(1)
+              with open("count.txt", "w") as f: f.write(str(total))
+              print(f"[DONE] Generated {total} TTS chunks (Revid ok={made}, loi={failed_count})")
+          main()
+          PY
 
-          echo "[TARGET] $FILE_URL"
+      # ============================================================
+      # ĐÓNG GÓI {slug}-AUDIO.zip (toàn bộ chunks/c_*.mp3, tên = chỉ số cue trong vtt)
+      # ============================================================
+      - name: Pack AUDIO zip (all TTS mp3) and upload to Pixeldrain
+        id: pixel
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
+          N=$(ls chunks/c_*.mp3 2>/dev/null | wc -l)
+          [ "$N" -gt 0 ] || { echo '::error::Không có file mp3 nào để đóng gói'; exit 1; }
+          rm -rf pack && mkdir -p pack
+          cp chunks/c_*.mp3 pack/
+          ZIP="${SLUG}-AUDIO.zip"
+          rm -f "$ZIP"
+          (cd pack && zip -0 -q -r "../$ZIP" .)
+          unzip -tq "$ZIP"
+          SIZE=$(stat -c %s "$ZIP")
+          echo "ZIP: $ZIP = $N mp3, $((SIZE / 1048576)) MB"
+          ID=""
+          MAX=6
+          for attempt in $(seq 1 "$MAX"); do
+            echo "[UP] Pixeldrain attempt $attempt/$MAX"
+            rm -f work/pd_upload.json
+            code=$(curl -sS -T "$ZIP" -u ":$PD_KEY" \
+              -o work/pd_upload.json -w "%{http_code}" \
+              "https://pixeldrain.com/api/file/${ZIP}" || true)
+            echo "HTTP $code: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
+            if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+              ID=$(jq -r '.id // empty' work/pd_upload.json)
+              [ -n "$ID" ] && break
+            fi
+            case "$code" in
+              401|403|413|422)
+                echo "::error::Pixeldrain từ chối (HTTP $code), không thử lại: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
+                exit 1 ;;
+            esac
+            [ "$attempt" -lt "$MAX" ] && sleep $(( attempt * 10 ))
+          done
+          [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử'; exit 1; }
+          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://pixeldrain.com/api/file/${ID}/info")
+          remote_size=$(jq -r '.size' <<<"$info")
+          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)"
+          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local'; exit 1; }
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "AUDIO Link: https://pixeldrain.com/u/${ID}"
 
-          check () {
-            code=$(curl -L -o /dev/null -s -w "%{http_code}" "$FILE_URL")
-            echo "HTTP CODE: $code"
-            [ "$code" = "200" ]
-          }
-
-          # Báo về ViCDN khi deploy thành công (dùng chung cho cả 2 lần check)
-          notify () {
-            curl -G "https://cp.ssplay.net/vicdn.php" \
-              --data-urlencode "type=ok0" \
-              --data-urlencode "key=${PROJECT}" \
-              --data-urlencode "slug=${BRANCH}" || true
-            curl -L -A "MySecretAgent_ViCDN_cc" "https://vicdn.cc/${BRANCH}?r=1" || true
-          }
-
-          echo "[WAIT] Waiting 1 minutes for Pages propagation..."
-          sleep 60
-
-          echo "[CHECK #1]"
-          if check; then
-            echo "[SUCCESS] File exists"
-            notify
-            exit 0
-          fi
-
-          echo "[WAIT] Still not found, wait extra 3 minutes..."
-          sleep 180
-
-          echo "[CHECK #2]"
-          if check; then
-            echo "[SUCCESS] File exists after delay"
-            notify
-            exit 0
-          fi
-
-          echo "[FAIL] File still missing → mark for redeploy"
-          echo "NEED_REDEPLOY=true" >> $GITHUB_ENV
-          exit 1
-
-      - name: Deploy to Cloudflare Pages (retry – reuse encoded files)
-        if: env.NEED_REDEPLOY == 'true'
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ github.event.inputs.token }}
-          accountId: ${{ github.event.inputs.account }}
-          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
+      - name: Notify VPS (type=sub, pixel = AUDIO zip ID)
+        env:
+          AUDIO_ID: ${{ steps.pixel.outputs.id }}
+        run: |
+          set -euo pipefail
+          [ -n "$AUDIO_ID" ] || { echo '::error::Không có Pixeldrain AUDIO ID'; exit 1; }
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            -G "https://cp.ssplay.net/bili.php" \
+            --data-urlencode "type=sub" \
+            --data-urlencode "slug=${SLUG}" \
+            --data-urlencode "pixel=${AUDIO_ID}"
+          echo
+          echo "Đã báo type=sub cho VPS (slug=${SLUG}, pixel=${AUDIO_ID})."
+          echo "Link cho workflow [3/3]: ${AUDIO_ID}-SUB-${SUB_ID}"
