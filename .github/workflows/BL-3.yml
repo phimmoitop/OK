@@ -1,0 +1,390 @@
+# ======================================================================
+# FILE 3 — SỬA 4 CHỖ; phần RENDER + DEPLOY Cloudflare giữ nguyên 100%
+# (render vẫn đọc work/mixed_audio.m4a, work/subtitle_geometry.json, ...)
+# ======================================================================
+
+# ---------- (0) Đổi mô tả input `link` ở đầu file ----------
+#   link:
+#     description: "AUDIOID-SUB-SUBID"
+#   (slug, token, page, account giữ nguyên)
+
+# ---------- (1) THAY step "Validate inputs and split link" ----------
+      - name: Validate inputs and split link
+        env:
+          LINK: ${{ inputs.link }}
+        run: |
+          set -euo pipefail
+          [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
+          LINK="$(echo -n "$LINK" | tr -d '[:space:]')"
+          [[ "$LINK" == *-SUB-* ]] || { echo '::error::link phải có dạng AUDIOID-SUB-SUBID (vd: sT1sbAuW-SUB-htUT5prY)'; exit 1; }
+          AUDIO_ID="${LINK%%-SUB-*}"
+          SUB_ID="${LINK#*-SUB-}"
+          [[ "$AUDIO_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo '::error::AUDIO ID không hợp lệ'; exit 1; }
+          [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]+$ ]]   || { echo '::error::SUB ID không hợp lệ'; exit 1; }
+          echo "AUDIO_ID=$AUDIO_ID" >> "$GITHUB_ENV"
+          echo "SUB_ID=$SUB_ID" >> "$GITHUB_ENV"
+          echo "AUDIO ({slug}-AUDIO.zip: c_*.mp3)                       = $AUDIO_ID"
+          echo "SUB   ({slug}-SUB.zip: sub + geometry + static + raw.txt) = $SUB_ID"
+          echo "RAW   ({slug}-RAW.mp4) = lấy ID từ raw.txt trong SUB zip"
+
+# ---------- (2) SỬA step "Install Python packages": thêm av + webvtt-py (cho bước mix) ----------
+      - name: Install Python packages
+        run: |
+          set -eux
+          python -m pip install --upgrade pip
+          python -m pip install \
+            opencv-python-headless \
+            pysubs2 \
+            webvtt-py \
+            av \
+            numpy \
+            requests
+          python3 <<'PY'
+          import cv2, pysubs2, webvtt, av, numpy, requests
+          print("ALL IMPORTS OK")
+          PY
+
+# ---------- (3) THAY 3 step cũ: "Download SUB zip...", "Download RAW video...",
+#                 "Validate downloaded media..." bằng các step dưới đây
+#                 (đặt ngay sau "Prepare directories", TRƯỚC step render) ----------
+      - name: Create Pixeldrain download helper
+        run: |
+          cat > pd_get.sh <<'SH'
+          # usage: pd_get <pixeldrain_id> <out_file> <zip|video>
+          # resume (-C -), kiểm tra sha256 nếu Pixeldrain có, không thì unzip -t / ffprobe
+          pd_get() {
+            local ID="$1" OUT="$2" KIND="$3"
+            local AUTH=()
+            [ -n "${PD_KEY:-}" ] && AUTH=(-u ":$PD_KEY")
+            local info want size avail
+            info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "${AUTH[@]}" "https://pixeldrain.com/api/file/${ID}/info" || true)
+            [ -n "$info" ] || { echo "::error::Không lấy được thông tin file '$ID' (sai ID / file đã bị xóa?)"; return 1; }
+            want=$(jq -r '.hash_sha256 // empty' <<<"$info" 2>/dev/null || true)
+            size=$(jq -r '.size // 0' <<<"$info" 2>/dev/null || echo 0)
+            avail=$(jq -r '.availability // empty' <<<"$info" 2>/dev/null || true)
+            echo "[GET] id=$ID name=$(jq -r '.name' <<<"$info") size=$((size / 1024)) KB sha256=${want:-?}"
+            [ -z "$avail" ] || echo "::warning::Pixeldrain báo file bị hạn chế: $avail"
+            _ok() {
+              [ -s "$OUT" ] || return 1
+              if [ -n "$want" ]; then
+                [ "$(sha256sum "$OUT" | cut -d' ' -f1)" = "$want" ]
+              elif [ "$KIND" = "zip" ]; then
+                unzip -tq "$OUT" >/dev/null 2>&1
+              else
+                local d; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT" 2>/dev/null || true)
+                [ -n "$d" ] && [ "$d" != "N/A" ]
+              fi
+            }
+            local ok=0 attempt
+            for attempt in $(seq 1 10); do
+              if _ok; then ok=1; break; fi
+              if [ -f "$OUT" ] && [ "$size" -gt 0 ] && [ "$(stat -c %s "$OUT")" -ge "$size" ]; then
+                echo "::warning::$OUT đủ dung lượng nhưng sai, tải lại từ đầu."
+                rm -f "$OUT"
+              fi
+              echo "[GET $OUT] attempt $attempt/10"
+              curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
+                "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" \
+                || echo "::warning::curl lỗi lần $attempt, thử tiếp (resume)."
+              sleep 3
+            done
+            if [ "$ok" -ne 1 ] && _ok; then ok=1; fi
+            [ "$ok" -eq 1 ] || { echo "::error::Không tải được file '$ID' hợp lệ sau 10 lần thử."; return 1; }
+            echo "[OK] $OUT hợp lệ"
+          }
+          SH
+
+      - name: Download SUB zip + AUDIO zip and extract
+        timeout-minutes: 60
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          source pd_get.sh
+
+          # ---- (1) {slug}-SUB.zip: 4 file sub + raw.txt ----
+          pd_get "$SUB_ID" sub.zip zip
+          unzip -o -q sub.zip -d dl_sub
+          for f in vietnamese.srt vietnamese.vtt subtitle_geometry.json static_regions.json raw.txt; do
+            [ -s "dl_sub/$f" ] || { echo "::error::Trong SUB zip thiếu file '$f' (có chắc ID sau -SUB- là {slug}-SUB.zip của bước 1?)"; exit 1; }
+          done
+          RAW_ID="$(tr -d '[:space:]' < dl_sub/raw.txt)"
+          [[ "$RAW_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::raw.txt không chứa ID hợp lệ: '$RAW_ID'"; exit 1; }
+          echo "RAW_ID=$RAW_ID" >> "$GITHUB_ENV"
+          echo "RAW ID (từ raw.txt) = $RAW_ID"
+          mv dl_sub/vietnamese.srt dl_sub/vietnamese.vtt \
+             dl_sub/subtitle_geometry.json dl_sub/static_regions.json work/
+
+          # ---- (2) {slug}-AUDIO.zip: chunks c_*.mp3 (chỉ số = thứ tự cue trong vtt) ----
+          pd_get "$AUDIO_ID" audio.zip zip
+          mkdir -p chunks
+          unzip -o -q audio.zip -d chunks
+          N=$(ls chunks/c_*.mp3 2>/dev/null | wc -l)
+          [ "$N" -gt 0 ] || { echo "::error::AUDIO zip không có file c_*.mp3 nào (có chắc ID trước -SUB- là {slug}-AUDIO.zip của bước 2?)"; exit 1; }
+          echo "AUDIO: $N file mp3"
+
+          rm -rf dl_sub sub.zip audio.zip
+          ls -lh work/
+
+      - name: Download RAW video from Pixeldrain (ID lấy từ raw.txt)
+        timeout-minutes: 90
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          source pd_get.sh
+          pd_get "$RAW_ID" raw_video.mp4 video
+          ls -lh raw_video.mp4
+
+      - name: Validate downloaded media (video / geometry / vtt khớp nhau)
+        run: |
+          set -euo pipefail
+          V=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4)
+          WH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 raw_video.mp4)
+          echo "video=${V}s ${WH}"
+          python3 - "$V" "$WH" <<'PY'
+          import json, sys, glob, re, webvtt
+          v = float(sys.argv[1])
+          w, h = (int(x) for x in sys.argv[2].split("x"))
+          if v <= 0:
+              print("::error::Duration không hợp lệ"); sys.exit(1)
+          g = json.load(open("work/subtitle_geometry.json", encoding="utf-8"))
+          if not g.get("valid") or not g.get("segments"):
+              print("::error::subtitle_geometry.json không hợp lệ (OCR bước 1 chưa tìm được điểm neo)."); sys.exit(1)
+          if (int(g["video_width"]), int(g["video_height"])) != (w, h):
+              print(f"::error::Kích thước video RAW {w}x{h} khác geometry {g['video_width']}x{g['video_height']} -> sai cặp SUB/RAW."); sys.exit(1)
+          if abs(float(g["duration_seconds"]) - v) > 2:
+              print(f"::error::Duration geometry {g['duration_seconds']}s khác video {v:.1f}s -> sai cặp SUB/RAW."); sys.exit(1)
+          n_cues = len(webvtt.read("work/vietnamese.vtt"))
+          idx = [int(re.search(r"c_(\d+)\.mp3", p).group(1)) for p in glob.glob("chunks/c_*.mp3")]
+          if idx and max(idx) >= n_cues:
+              print(f"::error::AUDIO zip có chỉ số mp3 tới {max(idx)} nhưng vtt chỉ có {n_cues} cue -> sai cặp AUDIO/SUB."); sys.exit(1)
+          print(f"OK: geometry {len(g['segments'])} đoạn blur | vtt {n_cues} cue | mp3 {len(idx)} file")
+          PY
+
+# ---------- (4) THÊM 2 step mix NGAY SAU step validate ở trên, TRƯỚC step render ----------
+      - name: Build TTS track (numpy, one pass) & final mix filter
+        run: |
+          set -euo pipefail
+          VIDEO_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 raw_video.mp4)
+          AUDIO_RATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of default=noprint_wrappers=1:nokey=1 raw_video.mp4)
+          if [ -z "$AUDIO_RATE" ]; then AUDIO_RATE=44100; fi
+          echo "audio_rate=$AUDIO_RATE" >> $GITHUB_ENV
+          export VIDEO_DURATION=$VIDEO_DURATION
+          export AUDIO_RATE=$AUDIO_RATE
+          python3 <<'EOF'
+          import os, wave, subprocess
+          import numpy as np
+          import av
+          import webvtt
+          # ---- Âm lượng / chất giọng TTS ----
+          TARGET_RMS = 0.28
+          TTS_BASS_DB = 4
+          TTS_COMP_MAKEUP = 2.0
+          TTS_VOLUME = 1.0
+          # ---- Mix / tốc độ ----
+          BG_RATIO = 0.2             # tiếng gốc khi CÓ thoại (muốn nhỏ hơn: 0.1, to hơn: 0.4)
+          BG_OUT = 0.8               # tiếng gốc khi KHÔNG có thoại
+          BG_IN = BG_RATIO
+          BG_GAIN_MAX = 4.0
+          DELAY_MS = 300
+          GAP_MS = 60
+          MAX_DRIFT_MS = 1500
+          LOOKAHEAD_MS = 400
+          MAX_SPEEDUP = 1.5
+          DUCK_PRE_MS = 500
+          DUCK_POST_MS = 400
+          SIL_THRESH = 10 ** (-50 / 20)
+          rate = int(os.environ["AUDIO_RATE"])
+          duration = float(os.environ["VIDEO_DURATION"])
+          def to_ms(s):
+              h, m, sec = s.replace(',', '.').split(':')
+              return int(float(h) * 3600000 + float(m) * 60000 + float(sec) * 1000)
+          def as_list(x):
+              if x is None: return []
+              return x if isinstance(x, list) else [x]
+          def decode_mono(path):
+              c = av.open(path)
+              rs = av.AudioResampler(format="flt", layout="mono", rate=rate)
+              parts = []
+              for frame in c.decode(audio=0):
+                  for f in as_list(rs.resample(frame)):
+                      parts.append(f.to_ndarray().reshape(-1))
+              for f in as_list(rs.resample(None)):
+                  parts.append(f.to_ndarray().reshape(-1))
+              c.close()
+              return np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, np.float32)
+          def atempo(x, speed):
+              try:
+                  p = subprocess.run(
+                      ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "f32le", "-ar", str(rate), "-ac", "1",
+                       "-i", "pipe:0", "-af", f"atempo={speed:.4f}", "-f", "f32le", "pipe:1"],
+                      input=x.astype("<f4").tobytes(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+                  out = np.frombuffer(p.stdout, dtype="<f4").copy()
+                  return out if out.size else x
+              except Exception:
+                  return x
+          def measure_bg_rms():
+              """Đo RMS phần có tiếng của audio gốc."""
+              try:
+                  p = subprocess.run(
+                      ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "raw_video.mp4",
+                       "-vn", "-map", "0:a:0", "-f", "f32le", "-ar", "8000", "-ac", "1", "pipe:1"],
+                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                  x = np.frombuffer(p.stdout, dtype="<f4")
+                  v = x[np.abs(x) > 0.02]
+                  return float(np.sqrt(np.mean(v ** 2))) if v.size > 1000 else 0.0
+              except Exception:
+                  return 0.0
+
+          bg_rms = measure_bg_rms()
+          BG_GAIN = float(np.clip(TARGET_RMS / bg_rms, 0.5, BG_GAIN_MAX)) if bg_rms > 1e-4 else 1.0
+          print(f"Original audio RMS={bg_rms:.3f} -> BG_GAIN={BG_GAIN:.2f}x "
+                f"(co thoai: {BG_RATIO * 100:.0f}% TTS, khong thoai: {BG_OUT * 100:.0f}%)")
+          total = int((duration + 10) * rate)
+          buf = np.zeros(total, dtype=np.float32)
+          vtt = webvtt.read("work/vietnamese.vtt")
+          n_cues = len(vtt)
+          starts = [max(0, int((to_ms(c.start) + DELAY_MS) * rate / 1000)) for c in vtt]
+          gap = int(GAP_MS * rate / 1000)
+          max_drift = int(MAX_DRIFT_MS * rate / 1000)
+          lookahead = int(LOOKAHEAD_MS * rate / 1000)
+          # ---------- Pass 1: đọc, cắt lặng, chuẩn hóa RMS ----------
+          clips = [None] * n_cues
+          skipped = 0
+          for i in range(n_cues):
+              path = f"chunks/c_{i}.mp3"
+              if not os.path.exists(path) or os.path.getsize(path) == 0:
+                  skipped += 1
+                  continue
+              try:
+                  x = decode_mono(path)
+              except Exception as e:
+                  print(f"Decode lỗi đoạn {i}: {e}")
+                  skipped += 1
+                  continue
+              loud = np.nonzero(np.abs(x) > SIL_THRESH)[0]
+              if loud.size == 0:
+                  skipped += 1
+                  continue
+              x = x[loud[0]:loud[-1] + 1]
+              voiced = x[np.abs(x) > 0.02]
+              if voiced.size:
+                  rms = float(np.sqrt(np.mean(voiced ** 2)))
+                  if rms > 1e-4:
+                      x = x * min(8.0, TARGET_RMS / rms)
+              clips[i] = x
+          # ---------- Pass 2: tốc độ mục tiêu mỗi câu, làm mượt để tăng đều ----------
+          need = np.ones(n_cues)
+          for i, x in enumerate(clips):
+              if x is None: continue
+              nxt = starts[i + 1] if i + 1 < n_cues else total
+              avail = max(1, nxt - starts[i] - gap)
+              need[i] = len(x) / avail
+          target = np.clip(need, 1.0, MAX_SPEEDUP)
+          smooth = target.copy()
+          for i in range(n_cues):
+              l = target[i - 1] if i > 0 else target[i]
+              r = target[i + 1] if i + 1 < n_cues else target[i]
+              smooth[i] = max(target[i], 0.5 * target[i] + 0.25 * (l + r))
+          # ---------- Pass 3: đặt tuần tự ----------
+          cursor = 0
+          placed = sped = overlapped = 0
+          max_shift = 0
+          spans_ms = []
+          for i, c in enumerate(vtt):
+              spans_ms.append((to_ms(c.start) - DUCK_PRE_MS, to_ms(c.end) + DUCK_POST_MS))
+              x = clips[i]
+              if x is None:
+                  continue
+              pos = max(starts[i], cursor + gap)
+              pos = min(pos, starts[i] + max_drift)
+              nxt = starts[i + 1] if i + 1 < n_cues else total
+              avail = nxt + lookahead - pos
+              sp = float(smooth[i])
+              if avail > 0:
+                  sp = max(sp, min(MAX_SPEEDUP, len(x) / avail))
+              if sp > 1.03:
+                  x = atempo(x, sp)
+                  sped += 1
+              if pos < cursor:
+                  overlapped += 1
+              if pos >= total:
+                  continue
+              n = min(len(x), total - pos)
+              buf[pos:pos + n] += x[:n]
+              cursor = pos + n
+              max_shift = max(max_shift, pos - starts[i])
+              spans_ms.append((pos * 1000.0 / rate - 150, (pos + n) * 1000.0 / rate + 250))
+              placed += 1
+          print(f"TTS placed={placed} skipped={skipped} sped_up={sped} overlapped={overlapped} "
+                f"max_shift={max_shift / rate:.2f}s")
+          # ---------- Ghi tts_track.wav (soft limiter) ----------
+          BLOCK = 1 << 22
+          with wave.open("work/tts_track.wav", "wb") as wf:
+              wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+              for s in range(0, total, BLOCK):
+                  x = buf[s:s + BLOCK].copy()
+                  a = np.abs(x)
+                  m = a > 0.85
+                  if m.any():
+                      x[m] = np.sign(x[m]) * (0.85 + 0.15 * np.tanh((a[m] - 0.85) / 0.15))
+                  wf.writeframes((np.clip(x, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+          # ---------- Đường cong hạ tiếng gốc (ducking) theo cue ----------
+          ENV_HZ = 1000
+          env = np.full(int((duration + 10) * ENV_HZ), BG_OUT, dtype=np.float32)
+          for a, b in spans_ms:
+              a = max(0, int(a * ENV_HZ / 1000)); b = min(len(env), int(b * ENV_HZ / 1000))
+              if b > a:
+                  env[a:b] = BG_IN
+          k = int(0.12 * ENV_HZ)
+          env = np.convolve(env, np.ones(k, np.float32) / k, mode="same")
+          idx = np.arange(len(env), dtype=np.float64)
+          with wave.open("work/duck_env.wav", "wb") as wf:
+              wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+              for s in range(0, total, BLOCK):
+                  e = min(total, s + BLOCK)
+                  t = np.arange(s, e, dtype=np.float64) * 1000.0 / rate * (ENV_HZ / 1000.0)
+                  g = np.interp(t, idx, env)
+                  wf.writeframes((np.clip(g, 0, 1) * 32767).astype("<i2").tobytes())
+          # ---------- Filter mix: input 0 = video gốc, 1 = tts_track, 2 = duck_env ----------
+          fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
+          tts_fx = ""
+          if TTS_BASS_DB:
+              tts_fx += f",bass=g={TTS_BASS_DB}:f=200"
+          tts_fx += f",acompressor=threshold=0.1:ratio=3:attack=10:release=120:makeup={TTS_COMP_MAKEUP}"
+          if abs(TTS_VOLUME - 1.0) > 0.01:
+              tts_fx += f",volume={TTS_VOLUME}"
+          with open("final_mix.txt", "w") as f:
+              f.write(f"[0:a]aresample={rate}:async=1,{fmt},volume={BG_GAIN:.3f},asetpts=PTS-STARTPTS[bg0];")
+              f.write(f"[2:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS[env];")
+              f.write("[bg0][env]amultiply[bg];")
+              f.write(f"[1:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS{tts_fx}[tts];")
+              f.write("[bg][tts]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.95:level=0[out_audio]")
+          EOF
+          ls -lh work/tts_track.wav work/duck_env.wav
+          cat final_mix.txt; echo
+
+      # ============================================================
+      # MIX AUDIO SẴN (tiếng gốc + TTS + ducking) -> work/mixed_audio.m4a
+      # ============================================================
+      - name: Mix final audio (original + TTS + ducking) -> mixed_audio.m4a
+        run: |
+          set -euo pipefail
+          RATE="${audio_rate:-44100}"
+          ffmpeg -y -hide_banner -loglevel error \
+            -i raw_video.mp4 -i work/tts_track.wav -i work/duck_env.wav \
+            -filter_complex_script final_mix.txt \
+            -map "[out_audio]" \
+            -c:a aac -ar "$RATE" -b:a 128k -movflags +faststart \
+            work/mixed_audio.m4a
+          ls -lh work/mixed_audio.m4a
+          V=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4)
+          A=$(ffprobe -v error -show_entries format=duration -of csv=p=0 work/mixed_audio.m4a)
+          echo "video=${V}s | mixed_audio=${A}s"
+          python3 - "$V" "$A" <<'PY'
+          import sys
+          v, a = float(sys.argv[1]), float(sys.argv[2])
+          if abs(v - a) > 5:
+              print(f"::warning::Audio mix lệch {abs(v - a):.1f}s so với video, kiểm tra lại.")
+          PY
