@@ -1,14 +1,55 @@
-# ======================================================================
-# FILE 3 — SỬA 4 CHỖ; phần RENDER + DEPLOY Cloudflare giữ nguyên 100%
-# (render vẫn đọc work/mixed_audio.m4a, work/subtitle_geometry.json, ...)
-# ======================================================================
+name: "NEW [3/3] SUB → HLS"
 
-# ---------- (0) Đổi mô tả input `link` ở đầu file ----------
-#   link:
-#     description: "AUDIOID-SUB-SUBID"
-#   (slug, token, page, account giữ nguyên)
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: "AUDIOID-SUB-SUBID"
+        required: true
+        type: string
+      slug:
+        description: "slug"
+        required: true
+        type: string
+      token:
+        description: "token"
+        required: true
+        type: string
+      page:
+        description: "page"
+        required: true
+        type: string
+      account:
+        description: "account"
+        required: true
+        type: string
 
-# ---------- (1) THAY step "Validate inputs and split link" ----------
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+      LC_ALL: "C.UTF-8"
+      LANG: "C.UTF-8"
+      # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
+      X264_PRESET: "medium"
+      X264_CRF: "23"
+      SLUG: ${{ inputs.slug }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # ============================================================
+      # TÁCH LINK "AUDIOID-SUB-SUBID" -> AUDIO_ID (zip bước 2) + SUB_ID (zip bước 1)
+      # RAW_ID sẽ lấy từ raw.txt nằm trong SUB zip
+      # ============================================================
       - name: Validate inputs and split link
         env:
           LINK: ${{ inputs.link }}
@@ -23,11 +64,34 @@
           [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]+$ ]]   || { echo '::error::SUB ID không hợp lệ'; exit 1; }
           echo "AUDIO_ID=$AUDIO_ID" >> "$GITHUB_ENV"
           echo "SUB_ID=$SUB_ID" >> "$GITHUB_ENV"
-          echo "AUDIO ({slug}-AUDIO.zip: c_*.mp3)                       = $AUDIO_ID"
+          echo "AUDIO ({slug}-AUDIO.zip: c_*.mp3)                         = $AUDIO_ID"
           echo "SUB   ({slug}-SUB.zip: sub + geometry + static + raw.txt) = $SUB_ID"
           echo "RAW   ({slug}-RAW.mp4) = lấy ID từ raw.txt trong SUB zip"
 
-# ---------- (2) SỬA step "Install Python packages": thêm av + webvtt-py (cho bước mix) ----------
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-core fontconfig unzip
+          # Cài font Oswald từ file zip có sẵn trong repo (bỏ variable font, chỉ dùng static)
+          sudo mkdir -p /usr/local/share/fonts/oswald
+          sudo unzip -o -j Oswald.zip '*.ttf' -x '*VariableFont*' -d /usr/local/share/fonts/oswald
+          sudo fc-cache -f
+          fc-list | grep -i oswald || { echo '::error::Không cài được font Oswald'; exit 1; }
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-render-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            pip-render-${{ runner.os }}-
+
       - name: Install Python packages
         run: |
           set -eux
@@ -44,14 +108,20 @@
           print("ALL IMPORTS OK")
           PY
 
-# ---------- (3) THAY 3 step cũ: "Download SUB zip...", "Download RAW video...",
-#                 "Validate downloaded media..." bằng các step dưới đây
-#                 (đặt ngay sau "Prepare directories", TRƯỚC step render) ----------
+      - name: Prepare directories
+        run: |
+          set -eux
+          mkdir -p work output dl
+
+      # ============================================================
+      # HÀM TẢI PIXELDRAIN DÙNG CHUNG
+      #   - resume (-C -), kiểm tra sha256 nếu Pixeldrain có, không thì unzip -t / ffprobe
+      #   - nếu có secret PIXELDRAIN_API_KEY thì dùng (đỡ bị giới hạn tải), không có thì tải ẩn danh
+      # ============================================================
       - name: Create Pixeldrain download helper
         run: |
           cat > pd_get.sh <<'SH'
           # usage: pd_get <pixeldrain_id> <out_file> <zip|video>
-          # resume (-C -), kiểm tra sha256 nếu Pixeldrain có, không thì unzip -t / ffprobe
           pd_get() {
             local ID="$1" OUT="$2" KIND="$3"
             local AUTH=()
@@ -94,6 +164,9 @@
           }
           SH
 
+      # ============================================================
+      # TẢI SUB.zip (bước 1) + AUDIO.zip (bước 2)
+      # ============================================================
       - name: Download SUB zip + AUDIO zip and extract
         timeout-minutes: 60
         env:
@@ -102,7 +175,7 @@
           set -euo pipefail
           source pd_get.sh
 
-          # ---- (1) {slug}-SUB.zip: 4 file sub + raw.txt ----
+          # ---- (1) {slug}-SUB.zip: sub + geometry + static + raw.txt ----
           pd_get "$SUB_ID" sub.zip zip
           unzip -o -q sub.zip -d dl_sub
           for f in vietnamese.srt vietnamese.vtt subtitle_geometry.json static_regions.json raw.txt; do
@@ -162,7 +235,9 @@
           print(f"OK: geometry {len(g['segments'])} đoạn blur | vtt {n_cues} cue | mp3 {len(idx)} file")
           PY
 
-# ---------- (4) THÊM 2 step mix NGAY SAU step validate ở trên, TRƯỚC step render ----------
+      # ============================================================
+      # MIX AUDIO: ghép TTS (chunks/c_*.mp3) theo vtt -> tts_track.wav + duck_env.wav + final_mix.txt
+      # ============================================================
       - name: Build TTS track (numpy, one pass) & final mix filter
         run: |
           set -euo pipefail
@@ -388,3 +463,321 @@
           if abs(v - a) > 5:
               print(f"::warning::Audio mix lệch {abs(v - a):.1f}s so với video, kiểm tra lại.")
           PY
+
+      # ============================================================
+      # RENDER: blur sub gốc + đặt sub Việt THEO TỪNG ĐOẠN ĐIỂM NEO (subtitle_geometry.json)
+      #   - Mỗi đoạn trong geometry có vùng blur riêng bám theo vị trí sub cục bộ (center_y, blur{})
+      #   - Các đoạn có vùng blur gần giống nhau gộp thành 1 "level" (1 nhánh crop+gblur),
+      #     bật/tắt bằng enable=between(t,..) -> ít nhánh, render nhanh
+      #   - Sub Việt đặt đúng center_y của đoạn chứa dòng sub đó
+      #   - Che watermark 2 góc trên theo static_regions.json
+      #   - Ghép audio mix sẵn (mixed_audio.m4a, vừa tạo ở bước trên)
+      # ============================================================
+      - name: Render Vietnamese video and HLS with per-anchor subtitle blur
+        env:
+          MAX_LEVELS: "8"      # tối đa số nhánh blur (càng ít càng render nhanh, nhưng vùng blur bị gộp rộng hơn)
+          SEG_PAD: "1.0"       # mỗi đoạn blur rộng thêm +-N giây quanh ranh giới đổi vị trí
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, math, os, re
+          from bisect import bisect_right
+          from pathlib import Path
+          import cv2
+          import numpy as np
+          import pysubs2
+          geo = json.loads(Path("work/subtitle_geometry.json").read_text(encoding="utf-8"))
+          segs = sorted(geo.get("segments") or [], key=lambda s: s["t_start"])
+          if not geo.get("valid") or not segs:
+              raise SystemExit("Subtitle geometry was not validated; refusing to render.")
+          width, height = int(geo["video_width"]), int(geo["video_height"])
+          duration = float(geo["duration_seconds"])
+          sub_h = int(geo["subtitle_height"])
+          center_x = width // 2
+          PAD = float(os.environ.get("SEG_PAD", "1.0"))
+          MAX_LEVELS = max(1, int(os.environ.get("MAX_LEVELS", "8")))
+          seg_starts = [s["t_start"] for s in segs]
+          def seg_at(sec):
+              i = bisect_right(seg_starts, sec) - 1
+              return segs[max(0, min(i, len(segs) - 1))]
+          # ------------------------------------------------------------
+          # Gom các đoạn có vùng blur gần giống nhau thành "level"
+          # ------------------------------------------------------------
+          def union(a, b):
+              return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+          def close(a, b):
+              h = max(a[3] - a[1], b[3] - b[1])
+              tol = max(6, int(.25 * h))
+              return abs(a[1] - b[1]) <= tol and abs(a[3] - b[3]) <= tol
+          levels = []
+          for si, s in enumerate(segs):
+              b = s["blur"]
+              rect = [int(b["x"]), int(b["y"]), int(b["x"] + b["width"]), int(b["y"] + b["height"])]
+              th = float(s.get("height") or sub_h)
+              a_t = 0.0 if si == 0 else max(0.0, s["t_start"] - PAD)
+              e_t = duration + 10.0 if si == len(segs) - 1 else s["t_end"] + PAD
+              for lv in levels:
+                  if close(lv["rect"], rect):
+                      lv["rect"] = union(lv["rect"], rect)
+                      lv["iv"].append((a_t, e_t))
+                      lv["th"] = max(lv["th"], th)
+                      break
+              else:
+                  levels.append({"rect": rect, "iv": [(a_t, e_t)], "th": th})
+          while len(levels) > MAX_LEVELS:
+              best = None
+              for i in range(len(levels)):
+                  for j in range(i + 1, len(levels)):
+                      ci = (levels[i]["rect"][1] + levels[i]["rect"][3]) / 2.0
+                      cj = (levels[j]["rect"][1] + levels[j]["rect"][3]) / 2.0
+                      d = abs(ci - cj)
+                      if best is None or d < best[0]:
+                          best = (d, i, j)
+              _, i, j = best
+              levels[i]["rect"] = union(levels[i]["rect"], levels[j]["rect"])
+              levels[i]["iv"] += levels[j]["iv"]
+              levels[i]["th"] = max(levels[i]["th"], levels[j]["th"])
+              del levels[j]
+          def merge_iv(iv):
+              iv = sorted(iv)
+              out = [list(iv[0])]
+              for a, b in iv[1:]:
+                  if a <= out[-1][1] + 0.01:
+                      out[-1][1] = max(out[-1][1], b)
+                  else:
+                      out.append([a, b])
+              return [(a, b) for a, b in out]
+          clean_levels = []
+          for lv in levels:
+              x1, y1, x2, y2 = lv["rect"]
+              x1, y1 = max(0, x1) // 2 * 2, max(0, y1) // 2 * 2
+              x2, y2 = min(width, x2), min(height, y2)
+              w, h = (x2 - x1) // 2 * 2, (y2 - y1) // 2 * 2
+              if w < 16 or h < 8:
+                  continue
+              clean_levels.append({"x": x1, "y": y1, "w": w, "h": h, "th": lv["th"],
+                                   "iv": merge_iv(lv["iv"])})
+          levels = clean_levels
+          if not levels:
+              raise SystemExit("No valid blur level; refusing to render.")
+          def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
+              """Mat na alpha feather. sides = (trai, phai, tren, duoi); 0 = canh do KHONG feather
+              (dung cho canh sat mep video de dai sat mep van duoc lam mo 100%)."""
+              fx, fy = float(max(1, fx)), float(max(1, fy))
+              xs = np.arange(w, dtype=np.float32)[None, :]
+              ys = np.arange(h, dtype=np.float32)[:, None]
+              big = np.float32(1e6)
+              l = xs / fx if sides[0] else big
+              r = (w - 1 - xs) / fx if sides[1] else big
+              t = ys / fy if sides[2] else big
+              b = (h - 1 - ys) / fy if sides[3] else big
+              alpha = np.clip(np.minimum(np.minimum(l, r), np.minimum(t, b)), 0.0, 1.0)
+              alpha = np.broadcast_to(alpha, (h, w))
+              cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
+          for old in Path("work").glob("blur_mask_*.png"):
+              old.unlink()
+          for k, lv in enumerate(levels):
+              fx = max(8, int(round(lv["h"] * .27)))
+              fy = max(3, int(round(lv["h"] * .09)))
+              feather_mask(lv["w"], lv["h"], fx, fy, f"work/blur_mask_{k}.png")
+          def enable_expr(iv):
+              if len(iv) == 1 and iv[0][0] <= 0.01 and iv[0][1] >= duration:
+                  return ""
+              return ":enable='" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in iv) + "'"
+          # ------------------------------------------------------------
+          # Phụ đề Việt (ASS): đặt theo center_y của đoạn điểm neo chứa dòng sub
+          # ------------------------------------------------------------
+          vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
+          max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
+          FONT_SCALE = 1.5
+          font_size = max(55, int(sub_h * .90 * FONT_SCALE))
+          font_size = min(font_size, max(55, int(width * .90 / max(1, max_chars * .50))))
+          ass = [
+              "[Script Info]", "Title: Vietnamese hard subtitles",
+              "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}",
+              "WrapStyle: 2", "ScaledBorderAndShadow: yes", "",
+              "[V4+ Styles]",
+              "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
+              f"Style: Default,Oswald,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,0,1",
+              "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
+          ]
+          def ass_time(ms):
+              total = max(0, int(ms))
+              h, total = divmod(total, 3600000)
+              m, total = divmod(total, 60000)
+              sec, total = divmod(total, 1000)
+              return f"{h}:{m:02}:{sec:02}.{total // 10:02}"
+          pos_log = []
+          for ev in vi.events:
+              text = ev.text.replace("\n", "\\N")
+              text = text.replace("{", "\\{").replace("}", "\\}")
+              mid = (ev.start + ev.end) / 2000.0
+              cy = int(seg_at(mid)["center_y"])
+              pos_log.append((ev.start / 1000.0, cy))
+              ass.append(
+                  f"Dialogue: 0,{ass_time(ev.start)},{ass_time(ev.end)},Default,,0,0,0,,"
+                  f"{{\\an5\\pos({center_x},{cy})}}{text}"
+              )
+          Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
+          # ---- Vùng che cố định (watermark 2 góc trên) từ bước static_detect ----
+          regions = []
+          sp = Path("work/static_regions.json")
+          if sp.exists():
+              try:
+                  regions = json.loads(sp.read_text(encoding="utf-8")).get("regions", [])
+              except Exception:
+                  regions = []
+          clean = []
+          for r in regions:
+              x, y, w, h = int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])
+              x -= x % 2; y -= y % 2
+              w = min(w, width - x) // 2 * 2
+              h = min(h, height - y) // 2 * 2
+              if w >= 16 and h >= 12:
+                  clean.append((x, y, w, h, r.get("feather", [1, 1, 1, 1])))
+          regions = clean
+          for old in Path("work").glob("static_mask_*.png"):
+              old.unlink()
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              fx = max(4, int(round(min(w, h) * .18)))
+              feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png", sides=fs)
+          # Input: 0 = raw_video.mp4, 1 = work/mixed_audio.m4a,
+          #        2..(1+L) = work/blur_mask_k.png (lặp, mỗi level 1 mask),
+          #        (2+L).. = work/static_mask_k.png (lặp)
+          L = len(levels)
+          n_split = 1 + L + len(regions)
+          graph = ["[0:v]split=%d[vbase]" % n_split
+                   + "".join(f"[lv{k}]" for k in range(L))
+                   + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
+          cur = "vbase"
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              sg = max(10, min(60, int(round(h * .60))))
+              graph.append(
+                  f"[sp{k}]crop={w}:{h}:{x}:{y},gblur=sigma={sg},format=rgb24[sb{k}];"
+                  f"[{2 + L + k}:v]format=gray[sm{k}];"
+                  f"[sb{k}][sm{k}]alphamerge[sq{k}];"
+                  f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
+              )
+              cur = f"sv{k}"
+          for k, lv in enumerate(levels):
+              sigma = max(24, int(round(lv["th"] * .80)))   # độ mờ theo chiều cao chữ của chính level đó
+              graph.append(
+                  f"[lv{k}]crop={lv['w']}:{lv['h']}:{lv['x']}:{lv['y']},"
+                  f"scale=iw/4:ih/4,gblur=sigma={max(6, sigma // 4)},"
+                  f"scale={lv['w']}:{lv['h']}:flags=bilinear,format=rgb24[lb{k}];"
+                  f"[{2 + k}:v]format=gray[lm{k}];"
+                  f"[lb{k}][lm{k}]alphamerge[lq{k}];"
+                  f"[{cur}][lq{k}]overlay=x={lv['x']}:y={lv['y']}:shortest=1{enable_expr(lv['iv'])}[lo{k}];"
+              )
+              cur = f"lo{k}"
+          graph.append(f"[{cur}]subtitles=work/vietnamese-overlay.ass[v]")
+          Path("work/render-filter.txt").write_text("".join(graph) + "\n", encoding="utf-8")
+          print(f"Subtitle segments (anchor): {len(segs)} | blur levels: {L}/{MAX_LEVELS}")
+          for i, s in enumerate(segs[:60]):
+              b = s["blur"]
+              print(f"  seg[{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s center_y={s['center_y']} "
+                    f"th={s.get('height')} | blur y={b['y']} h={b['height']}")
+          for k, lv in enumerate(levels):
+              span = ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in lv["iv"][:8])
+              print(f"  level[{k}] x={lv['x']} y={lv['y']} w={lv['w']} h={lv['h']} th={lv['th']:.0f} "
+                    f"| {len(lv['iv'])} khoảng: {span}")
+          ys = sorted({cy for _, cy in pos_log})
+          print(f"Sub Việt: {len(vi.events)} dòng, font={font_size}px, {len(ys)} vị trí y khác nhau: {ys[:12]}")
+          print(f"Static overlay blur regions: {len(regions)}")
+          for k, (x, y, w, h, fs) in enumerate(regions):
+              print(f"  [{k}] x={x} y={y} w={w} h={h} feather(l,r,t,b)={fs}")
+          PY
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
+          # Thứ tự input mask phải khớp filter graph: blur_mask_0..L-1 trước, rồi static_mask_0..
+          EXTRA=()
+          for m in $(ls work/blur_mask_*.png 2>/dev/null | sort -V) $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
+            EXTRA+=(-loop 1 -framerate 30 -t "$DUR" -i "$m")
+          done
+          ffmpeg -y -i raw_video.mp4 -i work/mixed_audio.m4a \
+            "${EXTRA[@]}" \
+            -filter_complex_script work/render-filter.txt \
+            -map "[v]" -map 1:a:0 \
+            -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
+            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -pix_fmt yuv420p \
+            -c:a copy \
+            -t "$DUR" final.mp4
+          mkdir -p output
+          ffmpeg -y -i final.mp4 -c copy -f hls \
+            -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
+            -hls_fmp4_init_filename "${SLUG}-index.png" \
+            -hls_segment_filename "output/${SLUG}-index%d.png" \
+            "output/${SLUG}.m3u8"
+
+      - name: Copy subtitle file into output folder
+        run: |
+          set -eux
+          cp work/vietnamese.vtt "output/${SLUG}.vtt"
+          ls -lh output/
+
+      - name: Deploy to Cloudflare Pages (first)
+        id: deploy1
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
+
+      - name: Verify Cloudflare deployment (branch domain check)
+        id: verify
+        continue-on-error: true
+        env:
+          PROJECT: ${{ github.event.inputs.page }}
+          BRANCH: ${{ github.event.inputs.slug }}
+        run: |
+          set -e
+          FILE_URL="https://${BRANCH}.${PROJECT}.pages.dev/${BRANCH}.m3u8"
+
+          echo "[TARGET] $FILE_URL"
+
+          check () {
+            code=$(curl -L -o /dev/null -s -w "%{http_code}" "$FILE_URL")
+            echo "HTTP CODE: $code"
+            [ "$code" = "200" ]
+          }
+
+          # Báo về ViCDN khi deploy thành công (dùng chung cho cả 2 lần check)
+          notify () {
+            curl -G "https://cp.ssplay.net/bili.php" \
+              --data-urlencode "type=ok0" \
+              --data-urlencode "key=${PROJECT}" \
+              --data-urlencode "slug=${BRANCH}" || true
+            curl -L -A "MySecretAgent_ViCDN_cc" "https://vicdn.cc/${BRANCH}?r=1" || true
+          }
+
+          echo "[WAIT] Waiting 1 minutes for Pages propagation..."
+          sleep 60
+
+          echo "[CHECK #1]"
+          if check; then
+            echo "[SUCCESS] File exists"
+            notify
+            exit 0
+          fi
+
+          echo "[WAIT] Still not found, wait extra 3 minutes..."
+          sleep 180
+
+          echo "[CHECK #2]"
+          if check; then
+            echo "[SUCCESS] File exists after delay"
+            notify
+            exit 0
+          fi
+
+          echo "[FAIL] File still missing → mark for redeploy"
+          echo "NEED_REDEPLOY=true" >> $GITHUB_ENV
+          exit 1
+
+      - name: Deploy to Cloudflare Pages (retry – reuse encoded files)
+        if: env.NEED_REDEPLOY == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
