@@ -175,7 +175,7 @@ jobs:
           FAST_HALF_K = 0.8        # nua chieu cao dai FAST = th * K
           FAST_STRIP_MAX_RATIO = 0.22   # dai FAST cao hon ty le nay cua video -> tat FAST
           FAST_MIN_SCORE = 0.60    # FAST: diem toi thieu de giu ket qua
-          BLUR_H_K = 1           # chieu cao vung blur = text_height * K (+ do dao dong cuc bo)
+          BLUR_H_K = 1.1           # chieu cao vung blur = text_height * K (+ do dao dong cuc bo)
           BLUR_RANGE_K = 0.5       # gom neo vao 1 doan blur khi cy dao dong <= K * th
           BLUR_MIN_GROUP = 2       # doan blur it hon N neo thi gop vao doan ben canh
           TH_MAX_RATIO = 0.12      # chieu cao chu > ty le nay cua video -> bo neo (do hong)
