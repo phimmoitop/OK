@@ -1756,8 +1756,25 @@ jobs:
           CONTAIN_RATIO = 0.60
           LOOKBACK = 3
           MIN_FINAL_CUES = 1
+          # --- Quy tắc riêng cho TTS ---
+          # "vi" đứng một mình -> "vy" (giữ nguyên hoa/thường)
+          VI_ALONE_RE = re.compile(r"(?<!\w)(vi)(?!\w)", re.IGNORECASE | re.UNICODE)
+          # Từ chỉ gồm 1 cụm 2-4 ký tự lặp lại (hihihi, hahaha, hehe...) hoặc 1 ký tự lặp >=4 lần (aaaaa)
+          REPEAT_RE = re.compile(r"(?<!\w)(?:(\w{2,4}?)\1+|(\w)\2{3,})(?!\w)", re.UNICODE)
+          DASH_RE = re.compile(r"[-\u2013\u2014]")
           def log(msg):
               print(msg, flush=True)
+          def _vi_to_vy(m):
+              w = m.group(1)
+              return "VY" if w.isupper() else ("Vy" if w[0].isupper() else "vy")
+          def tts_tweaks(t):
+              # 3) bỏ tiếng cười/lặp ký tự (hihihi, hahaha...). Nếu cả dòng chỉ có vậy -> rỗng -> dòng bị loại
+              t = REPEAT_RE.sub(" ", t)
+              # 2) bỏ dấu gạch ngang (thay bằng khoảng trắng để "anh-em" -> "anh em")
+              t = DASH_RE.sub(" ", t)
+              # 1) "vi" đứng một mình -> "vy"
+              t = VI_ALONE_RE.sub(_vi_to_vy, t)
+              return t 
           def clean_vi(text):
               t = unicodedata.normalize("NFKC", text or "")
               t = re.sub(r"\{[^}]*\}", " ", t)
@@ -1766,6 +1783,7 @@ jobs:
               t = t.replace("、", ", ").replace("。", ". ")
               had_cjk = bool(CJK_RE.search(t))
               t = CJK_RE.sub(" ", t)
+              t = tts_tweaks(t)
               t = t.replace("…", "...")
               t = re.sub(r"[\*_`#~^|\\<>]", " ", t)
               t = re.sub(r"\.{2,}", ".", t)
