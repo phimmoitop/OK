@@ -614,76 +614,76 @@ jobs:
               bx = (width - bw) // 2
               return {"x": bx, "y": y, "width": bw, "height": h, "width_ratio": .80,
                       "center_y": int(round(seg["center_y"]))}
-              def build_blur_segments(real, segs, width, height):
-                  """Chia moi doan vi tri lon thanh cac doan blur nho theo neo.
-                  FIX: (1) loc neo lac theo trung vi cua doan truoc khi chia nhom,
-                       (2) nhom le khong bi nhet vao nhom khac neu lam gian qua gioi han (bo luon)."""
-                  out = []
-                  for si, s in enumerate(segs):
-                      an = sorted([a for a in real if s["t_start"] <= a["t_mid"] < s["t_end"]],
-                                  key=lambda a: a["t_mid"])
-                      if not an:
-                          an = [{"cy": s["center_y"], "th": s["height"],
-                                 "t_mid": (s["t_start"] + s["t_end"]) / 2.0}]
+          def build_blur_segments(real, segs, width, height):
+              """Chia moi doan vi tri lon thanh cac doan blur nho theo neo.
+              FIX: (1) loc neo lac theo trung vi cua doan truoc khi chia nhom,
+                   (2) nhom le khong bi nhet vao nhom khac neu lam gian qua gioi han (bo luon)."""
+              out = []
+              for si, s in enumerate(segs):
+                  an = sorted([a for a in real if s["t_start"] <= a["t_mid"] < s["t_end"]],
+                              key=lambda a: a["t_mid"])
+                  if not an:
+                      an = [{"cy": s["center_y"], "th": s["height"],
+                             "t_mid": (s["t_start"] + s["t_end"]) / 2.0}]
+                  else:
+                      # --- (1) loc neo lac ---
+                      med = float(np.median([a["cy"] for a in an]))
+                      th_med = float(np.median([a["th"] for a in an]))
+                      tol = max(10.0, BLUR_OUTLIER_K * th_med)
+                      good = [a for a in an if abs(a["cy"] - med) <= tol]
+                      n_bad = len(an) - len(good)
+                      if n_bad and good:
+                          bad_cys = sorted(round(a["cy"]) for a in an if abs(a["cy"] - med) > tol)
+                          log(f"[BLUR] doan {si}: bo {n_bad}/{len(an)} neo lac (trung vi cy={med:.0f}, "
+                              f"tol={tol:.0f}px), cy lac={bad_cys[:10]}")
+                          an = good
+                  th_all = float(np.median([a["th"] for a in an]))
+                  limit = max(10.0, BLUR_RANGE_K * th_all)
+                  groups, cur = [], [an[0]]
+                  lo = hi = an[0]["cy"]
+                  for a in an[1:]:
+                      nlo, nhi = min(lo, a["cy"]), max(hi, a["cy"])
+                      if nhi - nlo <= limit:
+                          cur.append(a)
+                          lo, hi = nlo, nhi
                       else:
-                          # --- (1) loc neo lac ---
-                          med = float(np.median([a["cy"] for a in an]))
-                          th_med = float(np.median([a["th"] for a in an]))
-                          tol = max(10.0, BLUR_OUTLIER_K * th_med)
-                          good = [a for a in an if abs(a["cy"] - med) <= tol]
-                          n_bad = len(an) - len(good)
-                          if n_bad and good:
-                              bad_cys = sorted(round(a["cy"]) for a in an if abs(a["cy"] - med) > tol)
-                              log(f"[BLUR] doan {si}: bo {n_bad}/{len(an)} neo lac (trung vi cy={med:.0f}, "
-                                  f"tol={tol:.0f}px), cy lac={bad_cys[:10]}")
-                              an = good
-                      th_all = float(np.median([a["th"] for a in an]))
-                      limit = max(10.0, BLUR_RANGE_K * th_all)
-                      groups, cur = [], [an[0]]
-                      lo = hi = an[0]["cy"]
-                      for a in an[1:]:
-                          nlo, nhi = min(lo, a["cy"]), max(hi, a["cy"])
-                          if nhi - nlo <= limit:
-                              cur.append(a)
-                              lo, hi = nlo, nhi
+                          groups.append(cur)
+                          cur = [a]
+                          lo = hi = a["cy"]
+                  groups.append(cur)
+                  # --- (2) nhom qua it neo: chi gop neu khong pha gioi han, neu khong thi bo ---
+                  changed = True
+                  while changed and len(groups) > 1:
+                      changed = False
+                      for i, g in enumerate(groups):
+                          if len(g) >= BLUR_MIN_GROUP:
+                              continue
+                          gcy = float(np.median([x["cy"] for x in g]))
+                          cands = [j for j in (i - 1, i + 1) if 0 <= j < len(groups)]
+                          j = min(cands, key=lambda j: abs(float(np.median([x["cy"] for x in groups[j]])) - gcy))
+                          merged = groups[j] + g
+                          mcys = [a["cy"] for a in merged]
+                          if max(mcys) - min(mcys) <= limit:
+                              groups[j] = sorted(merged, key=lambda a: a["t_mid"])
                           else:
-                              groups.append(cur)
-                              cur = [a]
-                              lo = hi = a["cy"]
-                      groups.append(cur)
-                      # --- (2) nhom qua it neo: chi gop neu khong pha gioi han, neu khong thi bo ---
-                      changed = True
-                      while changed and len(groups) > 1:
-                          changed = False
-                          for i, g in enumerate(groups):
-                              if len(g) >= BLUR_MIN_GROUP:
-                                  continue
-                              gcy = float(np.median([x["cy"] for x in g]))
-                              cands = [j for j in (i - 1, i + 1) if 0 <= j < len(groups)]
-                              j = min(cands, key=lambda j: abs(float(np.median([x["cy"] for x in groups[j]])) - gcy))
-                              merged = groups[j] + g
-                              mcys = [a["cy"] for a in merged]
-                              if max(mcys) - min(mcys) <= limit:
-                                  groups[j] = sorted(merged, key=lambda a: a["t_mid"])
-                              else:
-                                  log(f"[BLUR] doan {si}: bo nhom le {len(g)} neo (cy={gcy:.0f}), "
-                                      f"khong gop vi se lam gian blur")
-                              del groups[i]
-                              changed = True
-                              break
-                      for gi, g in enumerate(groups):
-                          t0 = s["t_start"] if gi == 0 else (groups[gi - 1][-1]["t_mid"] + g[0]["t_mid"]) / 2.0
-                          t1 = s["t_end"] if gi == len(groups) - 1 else (g[-1]["t_mid"] + groups[gi + 1][0]["t_mid"]) / 2.0
-                          cys = [a["cy"] for a in g]
-                          lo, hi = min(cys), max(cys)
-                          th = float(np.median([a["th"] for a in g]))
-                          seg = {"center_y": (lo + hi) / 2.0, "height": th}
-                          out.append({"t_start": round(t0, 3), "t_end": round(t1, 3),
-                                      "center_y": int(round(seg["center_y"])), "height": int(round(th)),
-                                      "cy_lo": int(round(lo)), "cy_hi": int(round(hi)),
-                                      "anchors": len(g), "blur": make_blur(seg, width, height, span=hi - lo)})
-                  log(f"[BLUR] {len(out)} doan blur (tu {len(segs)} doan vi tri)")
-                  return out
+                              log(f"[BLUR] doan {si}: bo nhom le {len(g)} neo (cy={gcy:.0f}), "
+                                  f"khong gop vi se lam gian blur")
+                          del groups[i]
+                          changed = True
+                          break
+                  for gi, g in enumerate(groups):
+                      t0 = s["t_start"] if gi == 0 else (groups[gi - 1][-1]["t_mid"] + g[0]["t_mid"]) / 2.0
+                      t1 = s["t_end"] if gi == len(groups) - 1 else (g[-1]["t_mid"] + groups[gi + 1][0]["t_mid"]) / 2.0
+                      cys = [a["cy"] for a in g]
+                      lo, hi = min(cys), max(cys)
+                      th = float(np.median([a["th"] for a in g]))
+                      seg = {"center_y": (lo + hi) / 2.0, "height": th}
+                      out.append({"t_start": round(t0, 3), "t_end": round(t1, 3),
+                                  "center_y": int(round(seg["center_y"])), "height": int(round(th)),
+                                  "cy_lo": int(round(lo)), "cy_hi": int(round(hi)),
+                                  "anchors": len(g), "blur": make_blur(seg, width, height, span=hi - lo)})
+              log(f"[BLUR] {len(out)} doan blur (tu {len(segs)} doan vi tri)")
+              return out
           # ------------------------------------------------------------
           # GIAI DOAN 2: OCR toan video theo tung doan (song song)
           # ------------------------------------------------------------
