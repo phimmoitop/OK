@@ -255,7 +255,7 @@ jobs:
           from difflib import SequenceMatcher
           VIDEO = "raw_video.mp4"
           OUT = Path("work/ocr")
-          FPS = 2.0
+          FPS = 3.0
           STEP = 1.0 / FPS
           WIN = 45.0               # khoang cach giua 2 diem neo (giay)
           SAMPLES_PER_WIN = 6      # so frame mau toi da moi cua so (video ngan se tu tang)
