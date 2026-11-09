@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "https://www.bilibili.com/video/BV1YZJb6RELN"
+        description: "https://www.bilibili.com/video/BV1YZJb6RELN?p=1 (tuỳ chọn thêm &ep1-start=0&ep1-end=7215&ep2-start=7216&ep2-end=14400 ... đơn vị giây)"
         required: true
         type: string
       slug:
-        description: "slug"
+        description: "slug (nếu cắt nhiều ep: slug của ep ĐẦU, phải kết thúc bằng số, vd tv-id-1-14 -> ep sau tự thành tv-id-1-15)"
         required: true
         type: string
 
@@ -96,7 +96,125 @@ jobs:
       - name: Prepare directories
         run: |
           set -eux
-          mkdir -p work work/ocr
+          mkdir -p work work/eps
+
+      # ============================================================
+      # PARSE URL: tách tham số epN-start / epN-end ra khỏi link,
+      # tính slug riêng cho từng ep (slug đầu + offset ở số cuối).
+      # Kết quả: work/plan.json + output clean_url (link sạch để yt-dlp tải)
+      # ============================================================
+      - name: Create plan script (parse ep params from URL)
+        run: |
+          cat > plan_eps.py <<'PY'
+          """
+          Doc link + slug -> work/plan.json
+            { "clean_url": "...", "split": bool,
+              "eps": [ {"n": 1, "slug": "...", "start": float|None, "end": float|None}, ... ] }
+          - Tham so epN-start / epN-end (giay hoac HH:MM:SS) bi loai khoi URL truoc khi tai.
+          - Khong co tham so ep nao -> 1 ep duy nhat, giu nguyen slug, khong cat.
+          - Co >= 2 ep -> slug phai ket thuc bang so; ep thu k co slug = so cuoi + (epK - ep dau).
+          """
+          import json, os, re, sys
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+          link = os.environ["VIDEO_URL"].strip()
+          slug = os.environ["SLUG"].strip()
+          EP_KEY = re.compile(r"^ep(\d+)-(start|end)$", re.I)
+          SLUG_OK = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def to_sec(v, name):
+              v = v.strip()
+              try:
+                  if ":" in v:
+                      parts = [float(x) for x in v.split(":")]
+                      if len(parts) > 3:
+                          raise ValueError
+                      sec = 0.0
+                      for p in parts:
+                          sec = sec * 60 + p
+                  else:
+                      sec = float(v)
+              except ValueError:
+                  fail(f"{name}='{v}' khong phai so giay (hoac HH:MM:SS)")
+              if sec < 0:
+                  fail(f"{name}='{v}' khong duoc am")
+              return sec
+
+          u = urlsplit(link)
+          keep, raw = [], {}
+          for k, v in parse_qsl(u.query, keep_blank_values=True):
+              m = EP_KEY.match(k)
+              if m:
+                  raw.setdefault(int(m.group(1)), {})[m.group(2).lower()] = v
+              else:
+                  keep.append((k, v))
+          clean_url = urlunsplit((u.scheme, u.netloc, u.path, urlencode(keep), ""))
+
+          eps = []
+          if not raw:
+              eps.append({"n": 1, "slug": slug, "start": None, "end": None})
+              split = False
+          else:
+              split = True
+              nums = sorted(raw)
+              first = nums[0]
+              for i, n in enumerate(nums):
+                  d = raw[n]
+                  if "start" in d:
+                      s = to_sec(d["start"], f"ep{n}-start")
+                  elif i == 0:
+                      s = 0.0
+                  else:
+                      fail(f"ep{n} thieu ep{n}-start")
+                  if "end" in d:
+                      e = to_sec(d["end"], f"ep{n}-end")
+                  elif i + 1 < len(nums) and "start" in raw[nums[i + 1]]:
+                      e = to_sec(raw[nums[i + 1]]["start"], f"ep{nums[i + 1]}-start")
+                  else:
+                      e = None
+                  if e is not None and e <= s:
+                      fail(f"ep{n}: end ({e}) phai lon hon start ({s})")
+                  eps.append({"n": n, "start": s, "end": e, "offset": n - first})
+              for a, b in zip(eps, eps[1:]):
+                  if a["end"] is not None and b["start"] < a["end"] - 2.0:
+                      fail(f"ep{a['n']} va ep{b['n']} chong lan thoi gian ({a['end']} > {b['start']})")
+              if len(eps) > 1:
+                  m = re.match(r"^(.*?)(\d+)$", slug)
+                  if not m:
+                      fail("Cat tu 2 ep tro len: slug phai ket thuc bang so (vd tv-id-1-14)")
+                  prefix, num = m.group(1), m.group(2)
+                  for ep in eps:
+                      ep["slug"] = prefix + str(int(num) + ep["offset"]).zfill(len(num))
+              else:
+                  eps[0]["slug"] = slug
+              for ep in eps:
+                  ep.pop("offset", None)
+                  if not SLUG_OK.match(ep["slug"]):
+                      fail(f"slug sinh ra khong hop le: {ep['slug']}")
+
+          plan = {"clean_url": clean_url, "split": split, "eps": eps}
+          Path("work/plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(f"clean_url = {clean_url}")
+          print(f"split     = {split}")
+          for ep in eps:
+              print(f"  ep{ep['n']}: slug={ep['slug']} start={ep['start']} end={ep['end']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"clean_url={clean_url}\n")
+              f.write(f"split={'true' if split else 'false'}\n")
+          PY
+
+      - name: Parse URL (episode plan)
+        id: plan
+        env:
+          VIDEO_URL: ${{ inputs.link }}
+        run: |
+          set -euo pipefail
+          python3 plan_eps.py
 
       - name: Prepare Bilibili cookies (inline Python)
         env:
@@ -135,11 +253,12 @@ jobs:
       - name: Download Bilibili video
         timeout-minutes: 180
         env:
-          VIDEO_URL: ${{ inputs.link }}
+          VIDEO_URL: ${{ steps.plan.outputs.clean_url }}
           MAX_ATTEMPTS: "40"
         run: |
           set -uo pipefail
           BILIBILI_URL="$VIDEO_URL"
+          echo "Tai: $BILIBILI_URL"
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
           COMMON=(
             --cookies work/cookies.txt --no-playlist
@@ -188,51 +307,236 @@ jobs:
           echo "duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4)"
 
       # ============================================================
-      # UPLOAD RAW LÊN PIXELDRAIN với tên {slug}-RAW.mp4 -> lấy RAW ID
-      # (upload ngay sau khi tải xong, trước khi OCR/dịch)
+      # CẮT VIDEO THEO EP (nếu URL có epN-start/epN-end), dùng -c copy.
+      # Mốc cắt được dời về KEYFRAME gần nhất -> không lỗi frame.
+      # Mốc end của ep trước & start của ep sau sát nhau (<=2s) -> dùng chung 1 điểm cắt.
+      # Kết quả: work/eps/<slug>/raw_video.mp4 + work/eps.json
       # ============================================================
-      - name: Upload RAW video to Pixeldrain
-        id: pixel_raw
+      - name: Create split script
+        run: |
+          cat > split_video.py <<'PY'
+          """
+          Doc work/plan.json, cat raw_video.mp4 thanh tung ep (stream copy, can keyframe).
+          Khong co ep nao -> chi chuyen file vao work/eps/<slug>/raw_video.mp4.
+          Ghi work/eps.json: [ {n, slug, dir, video, start, end, duration} ]
+          """
+          import json, shutil, subprocess, sys
+          from pathlib import Path
+
+          VIDEO = Path("raw_video.mp4")
+          WORK = Path("work")
+          SHARE_GAP = 2.0       # end ep truoc ~ start ep sau (<= N giay) -> dung chung 1 diem cat
+          MIN_EP_SECONDS = 1.0
+
+          def log(msg):
+              print(msg, flush=True)
+
+          def fail(msg):
+              print(f"::error::{msg}", flush=True)
+              sys.exit(1)
+
+          def probe_duration(path):
+              out = subprocess.run(
+                  ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=nw=1:nk=1", str(path)],
+                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+              try:
+                  return float(out)
+              except ValueError:
+                  return None
+
+          def keyframes_near(t):
+              """Liet ke thoi diem cac keyframe quanh t (doc packet flags, khong decode -> rat nhanh)."""
+              for radius in (30, 120, 600):
+                  lo, hi = max(0.0, t - radius), t + radius
+                  out = subprocess.run(
+                      ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                       "-read_intervals", f"{lo:.3f}%{hi:.3f}",
+                       "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(VIDEO)],
+                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout
+                  ks = []
+                  for line in out.splitlines():
+                      parts = line.strip().split(",")
+                      if len(parts) >= 2 and parts[0] not in ("", "N/A") and "K" in parts[1]:
+                          try:
+                              ks.append(float(parts[0]))
+                          except ValueError:
+                              pass
+                  if ks:
+                      return sorted(ks)
+              return []
+
+          def main():
+              plan = json.loads((WORK / "plan.json").read_text(encoding="utf-8"))
+              eps = plan["eps"]
+              dur = probe_duration(VIDEO)
+              if not dur:
+                  fail("Khong doc duoc do dai raw_video.mp4")
+              log(f"[SPLIT] video dai {dur:.3f}s | split={plan['split']} | {len(eps)} ep")
+              result = []
+
+              if not plan["split"]:
+                  ep = eps[0]
+                  d = WORK / "eps" / ep["slug"]
+                  d.mkdir(parents=True, exist_ok=True)
+                  shutil.move(str(VIDEO), str(d / "raw_video.mp4"))
+                  result.append({"n": ep["n"], "slug": ep["slug"], "dir": str(d),
+                                 "video": str(d / "raw_video.mp4"), "start": 0.0, "end": dur, "duration": dur})
+                  (WORK / "eps.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                  log("[SPLIT] khong co epN-start/epN-end -> lay toan bo video")
+                  return
+
+              def snap(t):
+                  if t <= 0.05:
+                      return 0.0
+                  if t >= dur - 0.05:
+                      return dur
+                  ks = keyframes_near(t)
+                  if not ks:
+                      fail(f"Khong tim thay keyframe nao quanh {t:.1f}s")
+                  return min(ks, key=lambda k: abs(k - t))
+
+              # --- 1) mốc yeu cau (da kep vao do dai video) ---
+              req_s, req_e = [], []
+              for ep in eps:
+                  s = float(ep["start"] or 0.0)
+                  e = ep["end"]
+                  if s >= dur - 0.5:
+                      fail(f"ep{ep['n']}: start={s:.1f}s vuot qua do dai video ({dur:.1f}s)")
+                  if e is None or e >= dur - 0.5:
+                      if e is not None:
+                          log(f"::warning::ep{ep['n']}: end={e:.1f}s >= do dai video ({dur:.1f}s) -> cat den het video")
+                      e = dur
+                  req_s.append(s)
+                  req_e.append(float(e))
+
+              # --- 2) can keyframe (diem cat chung cho 2 ep sat nhau) ---
+              n = len(eps)
+              S = [None] * n
+              E = [None] * n
+              for i in range(n):
+                  if S[i] is None:
+                      S[i] = snap(req_s[i])
+                  if i + 1 < n and abs(req_s[i + 1] - req_e[i]) <= SHARE_GAP:
+                      c = snap(req_s[i + 1])
+                      E[i] = c
+                      S[i + 1] = c
+                  else:
+                      E[i] = snap(req_e[i])
+
+              # --- 3) cat bang stream copy ---
+              for i, ep in enumerate(eps):
+                  s, e = S[i], E[i]
+                  if e - s < MIN_EP_SECONDS:
+                      fail(f"ep{ep['n']}: doan sau khi can keyframe qua ngan ({s:.2f}s -> {e:.2f}s)")
+                  d = WORK / "eps" / ep["slug"]
+                  d.mkdir(parents=True, exist_ok=True)
+                  out = d / "raw_video.mp4"
+                  log(f"[SPLIT] ep{ep['n']} ({ep['slug']}): yeu cau {req_s[i]:.2f}s -> {req_e[i]:.2f}s | "
+                      f"keyframe {s:.3f}s -> {e:.3f}s (lech {s - req_s[i]:+.2f}s / {e - req_e[i]:+.2f}s)")
+                  cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                         "-ss", f"{s + 0.001:.3f}" if s > 0 else "0", "-i", str(VIDEO)]
+                  if e < dur - 0.01:
+                      cmd += ["-t", f"{e - s - 0.003:.3f}"]
+                  cmd += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                          "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(out)]
+                  r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+                      fail(f"ffmpeg cat ep{ep['n']} that bai: {r.stderr[-500:]}")
+                  od = probe_duration(out)
+                  if not od:
+                      fail(f"ep{ep['n']}: file cat ra khong doc duoc do dai")
+                  if abs(od - (e - s)) > 3.0:
+                      log(f"::warning::ep{ep['n']}: do dai thuc te {od:.2f}s lech so voi du kien {e - s:.2f}s")
+                  chk = subprocess.run(
+                      ["ffmpeg", "-v", "error", "-i", str(out), "-t", "20", "-f", "null", "-"],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if chk.stderr.strip():
+                      log(f"::warning::ep{ep['n']}: decode thu 20s dau co canh bao: {chk.stderr.strip()[:300]}")
+                  log(f"[SPLIT] ep{ep['n']} OK: {od:.2f}s, {out.stat().st_size // 1048576} MB -> {out}")
+                  result.append({"n": ep["n"], "slug": ep["slug"], "dir": str(d), "video": str(out),
+                                 "start": s, "end": e, "duration": od})
+
+              VIDEO.unlink()  # giai phong dia, ban goc khong can nua
+              (WORK / "eps.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+              log(f"[SPLIT] xong {len(result)} ep -> work/eps.json")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Split video by episode (stream copy, keyframe-aligned)
+        run: |
+          set -euo pipefail
+          python3 split_video.py
+          cat work/eps.json
+          ls -lh work/eps/*/raw_video.mp4
+
+      # ============================================================
+      # PIXELDRAIN UPLOAD HELPER: bash pd_upload.sh <file> <ten-tren-pixeldrain> -> in ra ID (stdout)
+      # ============================================================
+      - name: Create Pixeldrain upload helper
+        run: |
+          cat > pd_upload.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          FILE="$1"
+          NAME="$2"
+          : "${PD_KEY:?Missing PD_KEY}"
+          SIZE=$(stat -c %s "$FILE")
+          echo "FILE: $NAME = $((SIZE / 1048576)) MB ($SIZE bytes)" >&2
+          TMP=$(mktemp)
+          ID=""
+          MAX=6
+          for attempt in $(seq 1 "$MAX"); do
+            echo "[UP] Pixeldrain attempt $attempt/$MAX" >&2
+            rm -f "$TMP"
+            code=$(curl -sS -T "$FILE" -u ":$PD_KEY" \
+              -o "$TMP" -w "%{http_code}" \
+              "https://pixeldrain.com/api/file/${NAME}" || true)
+            echo "HTTP $code: $(head -c 300 "$TMP" 2>/dev/null || true)" >&2
+            if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+              ID=$(jq -r '.id // empty' "$TMP")
+              if [ -n "$ID" ]; then break; fi
+            fi
+            case "$code" in
+              401|403|413|422)
+                echo "::error::Pixeldrain từ chối (HTTP $code), không thử lại: $(head -c 300 "$TMP" 2>/dev/null || true)" >&2
+                exit 1 ;;
+            esac
+            if [ "$attempt" -lt "$MAX" ]; then sleep $(( attempt * 10 )); fi
+          done
+          [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử' >&2; exit 1; }
+          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://pixeldrain.com/api/file/${ID}/info")
+          remote_size=$(jq -r '.size' <<<"$info")
+          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)" >&2
+          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local' >&2; exit 1; }
+          echo "$ID"
+          SH
+
+      # ============================================================
+      # UPLOAD RAW từng ep lên Pixeldrain với tên {slug}-RAW.mp4
+      # ============================================================
+      - name: Upload RAW videos to Pixeldrain (one per episode)
         env:
           PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
           [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
-          NAME="${SLUG}-RAW.mp4"
-          SIZE=$(stat -c %s raw_video.mp4)
-          echo "FILE: $NAME = $((SIZE / 1048576)) MB"
-          ID=""
-          MAX=6
-          for attempt in $(seq 1 "$MAX"); do
-            echo "[UP] Pixeldrain attempt $attempt/$MAX"
-            rm -f work/pd_upload.json
-            code=$(curl -sS -T raw_video.mp4 -u ":$PD_KEY" \
-              -o work/pd_upload.json -w "%{http_code}" \
-              "https://pixeldrain.com/api/file/${NAME}" || true)
-            echo "HTTP $code: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
-            if [ "$code" = "201" ] || [ "$code" = "200" ]; then
-              ID=$(jq -r '.id // empty' work/pd_upload.json)
-              [ -n "$ID" ] && break
-            fi
-            case "$code" in
-              401|403|413|422)
-                echo "::error::Pixeldrain từ chối (HTTP $code), không thử lại: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
-                exit 1 ;;
-            esac
-            [ "$attempt" -lt "$MAX" ] && sleep $(( attempt * 10 ))
+          for ep_slug in $(jq -r '.[].slug' work/eps.json); do
+            echo "::group::RAW upload ${ep_slug}"
+            id=$(bash pd_upload.sh "work/eps/${ep_slug}/raw_video.mp4" "${ep_slug}-RAW.mp4")
+            [ -n "$id" ] || { echo "::error::Không có RAW ID cho ${ep_slug}"; exit 1; }
+            printf '%s' "$id" > "work/eps/${ep_slug}/raw_id.txt"
+            echo "RAW Link ${ep_slug}: https://pixeldrain.com/u/${id}"
+            echo "::endgroup::"
           done
-          [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử'; exit 1; }
-          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
-            "https://pixeldrain.com/api/file/${ID}/info")
-          remote_size=$(jq -r '.size' <<<"$info")
-          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)"
-          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local'; exit 1; }
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
-          echo "RAW Link: https://pixeldrain.com/u/${ID}"
 
       # ============================================================
       # OCR: neo theo cửa sổ, chia đoạn theo y, dải FAST khít 1 dòng,
       #      blur bám theo từng đoạn sub (không phình to cả video)
+      # (đọc VIDEO / WORK_DIR từ biến môi trường -> chạy riêng cho từng ep)
       # ============================================================
       - name: Create OCR script
         run: |
@@ -245,16 +549,18 @@ jobs:
           2) Gom neo thanh DOAN vi tri (mac dinh 1 doan; chi tach khi >= 2 neo lien tiep cung lech y).
           3) FAST (rec-only) chi bat khi dai khit 1 dong + do khop cao + ti le rac thap.
           4) Gop cue: gop frame lien tiep, roi gop cue gan nhau co chu gan giong.
-          5) Xuat work/subtitle_geometry.json dang { segments: [ {t_start,t_end,center_y,height,blur{}} ] }.
+          5) Xuat <WORK_DIR>/subtitle_geometry.json dang { segments: [ {t_start,t_end,center_y,height,blur{}} ] }.
              Moi segment la 1 doan BLUR nho bam theo vi tri sub cuc bo (neo dao dong <= BLUR_RANGE_K*th).
+          Bien moi truong: VIDEO (mac dinh raw_video.mp4), WORK_DIR (mac dinh work).
           """
           import cv2, json, math, os, random, re, subprocess, sys, time
           import multiprocessing as mp
           import numpy as np
           from pathlib import Path
           from difflib import SequenceMatcher
-          VIDEO = "raw_video.mp4"
-          OUT = Path("work/ocr")
+          VIDEO = os.environ.get("VIDEO", "raw_video.mp4")
+          WORK = Path(os.environ.get("WORK_DIR", "work"))
+          OUT = WORK / "ocr"
           FPS = 3.0
           STEP = 1.0 / FPS
           WIN = 45.0               # khoang cach giua 2 diem neo (giay)
@@ -859,7 +1165,7 @@ jobs:
               }
               def write_invalid(reason):
                   log(f"[GEOMETRY] KHONG HOP LE: {reason}")
-                  Path("work/subtitle_geometry.json").write_text(
+                  (WORK / "subtitle_geometry.json").write_text(
                       json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                   (OUT / "hardsub-3fps.srt").write_text("", encoding="utf-8")
                   (OUT / "ocr-review-needed.tsv").write_text(
@@ -1059,7 +1365,7 @@ jobs:
               blur_segs = build_blur_segments(real, segs, width, height)
               geometry["segments"] = blur_segs
               geometry["valid"] = bool(valid_geometry)
-              Path("work/subtitle_geometry.json").write_text(
+              (WORK / "subtitle_geometry.json").write_text(
                   json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
               with (OUT / "segments.tsv").open("w", encoding="utf-8") as f:
                   f.write("idx\tt_start\tt_end\tcenter_y\tcy_lo\tcy_hi\theight\tblur_y\tblur_h\n")
@@ -1081,7 +1387,7 @@ jobs:
                       cv2.rectangle(image, (bl["x"], bl["y"]),
                                     (bl["x"] + bl["width"], bl["y"] + bl["height"]), (0, 0, 255), 3)
                       cv2.rectangle(image, (x0, segs[seg_i]["ty0"]), (x1, segs[seg_i]["ty1"]), (0, 255, 255), 2)
-                      cv2.imwrite("work/subtitle-geometry-preview.jpg", image)
+                      cv2.imwrite(str(WORK / "subtitle-geometry-preview.jpg"), image)
               except Exception as e:
                   log(f"[PREVIEW] bo qua: {e!r}")
               needs_review = bool(review_rows) or not valid_geometry or not cues
@@ -1096,31 +1402,6 @@ jobs:
               main()
           PY
 
-      - name: OCR subtitles and detect per-video subtitle geometry
-        id: ocr
-        env:
-          OMP_NUM_THREADS: "1"
-          OCR_FAST: "1"   # 1 = tự thử chế độ nhanh (chỉ nhận dạng); 0 = luôn dùng det+rec
-        run: |
-          set -euo pipefail
-          mkdir -p work/ocr
-          python3 ocr_run.py
-          cp work/ocr/hardsub-3fps.srt work/native.srt
-
-      - name: Check subtitle geometry (stop early if OCR failed)
-        run: |
-          python3 <<'PY'
-          import json, sys
-          g = json.load(open("work/subtitle_geometry.json", encoding="utf-8"))
-          segs = g.get("segments") or []
-          if not g.get("valid") or not segs:
-              print("::error::Không xác định được vị trí sub (geometry invalid) -> dừng sớm, khỏi tốn công dịch/TTS.")
-              sys.exit(1)
-          print(f"Geometry OK: {len(segs)} đoạn blur, {g.get('anchors')} điểm neo / {g.get('windows')} cửa sổ, fast={g.get('fast_ocr')}")
-          for i, s in enumerate(segs[:30]):
-              print(f"  [{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']} h={s['height']} | blur y={s['blur']['y']} h={s['blur']['height']}")
-          PY
-
       - name: Create static overlay detection script
         run: |
           cat > static_detect.py <<'PY'
@@ -1129,13 +1410,14 @@ jobs:
           Lay 8-16 frame NGAU NHIEN (chia deu theo thoi gian, moi doan 1 frame), tim cac diem canh
           xuat hien o >=80% so frame VA gan nhu khong doi mau, CHI xet trong 2 goc tren.
           Neu co watermark nam trong goc -> che FULL goc do, sat mep video.
-          Ket qua: work/static_regions.json. Loi o day KHONG lam hong workflow.
+          Ket qua: <WORK_DIR>/static_regions.json. Loi o day KHONG lam hong workflow.
+          Bien moi truong: VIDEO (mac dinh raw_video.mp4), WORK_DIR (mac dinh work).
           """
           import cv2, json, math, os, random, subprocess
           import numpy as np
           from pathlib import Path
-          VIDEO = "raw_video.mp4"
-          WORK = Path("work")
+          VIDEO = os.environ.get("VIDEO", "raw_video.mp4")
+          WORK = Path(os.environ.get("WORK_DIR", "work"))
           W_SMALL = 800
           EDGE_PRESENT = 0.80
           STD_MAX = 10.0
@@ -1340,7 +1622,7 @@ jobs:
                   for r in regions:
                       cv2.rectangle(first_img, (r["x"], r["y"]), (r["x"] + r["w"], r["y"] + r["h"]),
                                     (255, 0, 255), 3)
-                  cv2.imwrite("work/static-regions-preview.jpg", first_img)
+                  cv2.imwrite(str(WORK / "static-regions-preview.jpg"), first_img)
               for r in regions:
                   log(f"[STATIC-OVERLAY] che: x={r['x']} y={r['y']} w={r['w']} h={r['h']} feather={r['feather']}")
               if not regions:
@@ -1353,19 +1635,11 @@ jobs:
               except Exception as e:
                   log(f"[STATIC-OVERLAY] loi, bo qua: {e!r}")
                   regions = []
-              Path("work/static_regions.json").write_text(
+              (WORK / "static_regions.json").write_text(
                   json.dumps({"regions": regions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           if __name__ == "__main__":
               main()
           PY
-
-      - name: Detect static overlays (top-left / top-right watermark)
-        env:
-          STATIC_DETECT: "1"
-        run: |
-          set -euo pipefail
-          python3 static_detect.py
-          cat work/static_regions.json
 
       # ============================================================
       # DỊCH: dọn sub Trung -> Gemini -> không bao giờ fallback tiếng Trung
@@ -1374,14 +1648,14 @@ jobs:
         run: |
           cat > translate_native.py <<'PY'
           """
-          Doc sub goc (work/native.srt, tieng Trung) -> DON SACH sub Trung (gop cue trung/gan giong,
+          Doc sub goc (<WORK_DIR>/native.srt, tieng Trung) -> DON SACH sub Trung (gop cue trung/gan giong,
           bo rac) -> dich sang tieng Viet bang Gemini (gioi han ky tu ngay trong prompt).
           Moi lan goi API random 1 model + 1 key.
           Loi server (500/503/504/timeout): retry toi da 20 lan, moi lan cach 90s.
           Loi limit (429): doi model/key, cho 90s.
           Dong sot / con chu Han KHONG retry ngay, gom lai het roi dich lai 1 luot o cuoi.
           Dong AI tra "..." (rac OCR khong doc duoc) = BO TRONG, KHONG BAO GIO giu lai tieng Trung.
-          Ket qua: work/vi_raw.json (start, end, text, vi). Buoc finalize_vi.py se lam sach hoan toan.
+          Ket qua: <WORK_DIR>/vi_raw.json (start, end, text, vi). Buoc finalize_vi.py se lam sach hoan toan.
           """
           import os, re, time, random, json
           from difflib import SequenceMatcher
@@ -1389,7 +1663,7 @@ jobs:
           import pysubs2
           from google import genai
           from google.genai import types
-          WORK = Path("work")
+          WORK = Path(os.environ.get("WORK_DIR", "work"))
           NATIVE_SRT = WORK / "native.srt"
           MIN_CUE_DURATION = 0.10
           ZH_MERGE_GAP = 1.5
@@ -1718,17 +1992,10 @@ jobs:
               translated = translate_cues(cues)
               write_debug(translated)
               (WORK / "vi_raw.json").write_text(json.dumps(translated, ensure_ascii=False, indent=1), encoding="utf-8")
-              log("TRANSLATE COMPLETE -> work/vi_raw.json (chua hoan thien, chay finalize_vi.py)")
+              log("TRANSLATE COMPLETE -> vi_raw.json (chua hoan thien, chay finalize_vi.py)")
           if __name__ == "__main__":
               main()
           PY
-
-      - name: Run Translate (native sub → Vietnamese raw)
-        env:
-          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
-        run: |
-          set -euo pipefail
-          python translate_native.py
 
       # ============================================================
       # HOÀN THIỆN SUB VIỆT (làm sạch + khử trùng + kiểm tra cứng)
@@ -1737,17 +2004,17 @@ jobs:
         run: |
           cat > finalize_vi.py <<'PY'
           """
-          work/vi_raw.json -> work/vietnamese.srt + work/vietnamese.vtt (SACH).
+          <WORK_DIR>/vi_raw.json -> vietnamese.srt + vietnamese.vtt (SACH).
           1) Chuan hoa: NFKC, bo tag/markdown, XOA moi ky tu Han/CJK/fullwidth. Dong co chu Han ma con lai < 3 tu -> bo.
           2) Bo dong trong / chi co dau cau / khong co chu cai.
           3) Gop cau TRUNG hoac GAN GIONG nhau trong cua so thoi gian ngan, giu ban dai hon.
           4) Sua thoi gian: sap xep, khong chong lan, end > start.
           5) Kiem tra cung: khong CJK, khong cap lien ke trung lap, co it nhat vai cue. Loi -> exit 1.
           """
-          import json, re, sys, unicodedata
+          import json, os, re, sys, unicodedata
           from difflib import SequenceMatcher
           from pathlib import Path
-          WORK = Path("work")
+          WORK = Path(os.environ.get("WORK_DIR", "work"))
           CJK_RE = re.compile(r"[\u2e80-\u2fdf\u3000-\u30ff\u3100-\u31ff\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
           SHORT_WORDS = 4
           WIN_SHORT = 3.0
@@ -1872,7 +2139,7 @@ jobs:
                   for st, why, zh, vi in dropped:
                       f.write(f"{st:8.2f}s | {why:11s} | ZH={zh!r} | VI={vi!r}\n")
               log(f"[FINALIZE] raw={len(raw)} -> sach={n_clean} -> sau loai trung={n_dedup} | "
-                  f"bo {len(dropped)} dong (chi tiet: work/vi_dropped.txt)")
+                  f"bo {len(dropped)} dong (chi tiet: vi_dropped.txt)")
               if errors:
                   for e in errors[:30]:
                       print(f"::error::{e}")
@@ -1884,99 +2151,142 @@ jobs:
                   f.write("WEBVTT\n\n")
                   for c in out:
                       f.write(f"{ts(c['start'], '.')} --> {ts(c['end'], '.')}\n{c['text']}\n\n")
-              log(f"[FINALIZE] OK: {len(out)} cue sach -> work/vietnamese.srt / work/vietnamese.vtt")
+              log(f"[FINALIZE] OK: {len(out)} cue sach -> vietnamese.srt / vietnamese.vtt")
           if __name__ == "__main__":
               main()
           PY
 
-      - name: Finalize Vietnamese subtitles (clean + dedupe + validate)
+      # ============================================================
+      # SCRIPT XỬ LÝ 1 EP: OCR -> geometry -> static overlay -> dịch -> finalize
+      #                    -> đóng gói {slug}-SUB.zip -> upload Pixeldrain -> báo VPS
+      # Chạy bằng process riêng (bash process_episode.sh <slug>) nên lỗi ở ep này
+      # không chặn các ep còn lại.
+      # ============================================================
+      - name: Create per-episode pipeline script
         run: |
+          cat > process_episode.sh <<'SH'
+          #!/usr/bin/env bash
           set -euo pipefail
+          EP_SLUG="$1"
+          EP_DIR="work/eps/${EP_SLUG}"
+          export VIDEO="${EP_DIR}/raw_video.mp4"
+          export WORK_DIR="${EP_DIR}"
+          [ -s "$VIDEO" ] || { echo "::error::Không có video cho ${EP_SLUG}"; exit 1; }
+          [ -s "${EP_DIR}/raw_id.txt" ] || { echo "::error::Không có RAW ID cho ${EP_SLUG}"; exit 1; }
+          RAW_ID=$(cat "${EP_DIR}/raw_id.txt")
+          mkdir -p "${EP_DIR}/ocr"
+
+          echo "===== [1/6] OCR subtitles (${EP_SLUG}) ====="
+          python3 ocr_run.py
+          cp "${EP_DIR}/ocr/hardsub-3fps.srt" "${EP_DIR}/native.srt"
+
+          echo "===== [2/6] Check subtitle geometry (${EP_SLUG}) ====="
+          python3 <<'PY'
+          import json, os, sys
+          g = json.load(open(os.path.join(os.environ["WORK_DIR"], "subtitle_geometry.json"), encoding="utf-8"))
+          segs = g.get("segments") or []
+          if not g.get("valid") or not segs:
+              print("::error::Không xác định được vị trí sub (geometry invalid) -> dừng sớm, khỏi tốn công dịch/TTS.")
+              sys.exit(1)
+          print(f"Geometry OK: {len(segs)} đoạn blur, {g.get('anchors')} điểm neo / {g.get('windows')} cửa sổ, fast={g.get('fast_ocr')}")
+          for i, s in enumerate(segs[:30]):
+              print(f"  [{i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']} h={s['height']} | blur y={s['blur']['y']} h={s['blur']['height']}")
+          PY
+
+          echo "===== [3/6] Static overlay (${EP_SLUG}) ====="
+          python3 static_detect.py
+          cat "${EP_DIR}/static_regions.json"
+
+          echo "===== [4/6] Translate (${EP_SLUG}) ====="
+          python3 translate_native.py
+
+          echo "===== [5/6] Finalize Vietnamese (${EP_SLUG}) ====="
           python3 finalize_vi.py
+          echo "--- VIETNAMESE VTT (head) ---"
+          head -40 "${EP_DIR}/vietnamese.vtt" || true
+          wc -l "${EP_DIR}/vietnamese.vtt" || true
+          echo "--- DROPPED (head) ---"
+          head -30 "${EP_DIR}/vi_dropped.txt" || true
 
-      - name: Check final subtitle output
-        run: |
-          set -e
-          echo "===== VIETNAMESE VTT (head) ====="
-          head -40 work/vietnamese.vtt || true
-          wc -l work/vietnamese.vtt || true
-          echo "===== DROPPED (head) ====="
-          head -30 work/vi_dropped.txt || true
+          echo "===== [6/6] Pack + upload SUB zip + notify VPS (${EP_SLUG}) ====="
+          PACK="${EP_DIR}/pack"
+          rm -rf "$PACK" && mkdir -p "$PACK"
+          printf '%s' "$RAW_ID" > "${EP_DIR}/raw.txt"
+          cp "${EP_DIR}/vietnamese.srt"         "${PACK}/vietnamese.srt"
+          cp "${EP_DIR}/vietnamese.vtt"         "${PACK}/vietnamese.vtt"
+          cp "${EP_DIR}/subtitle_geometry.json" "${PACK}/subtitle_geometry.json"
+          cp "${EP_DIR}/static_regions.json"    "${PACK}/static_regions.json"
+          cp "${EP_DIR}/raw.txt"                "${PACK}/raw.txt"
+          ZIP_NAME="${EP_SLUG}-SUB.zip"
+          ZIP_PATH="${EP_DIR}/${ZIP_NAME}"
+          rm -f "$ZIP_PATH"
+          (cd "$PACK" && zip -0 -q -r "../${ZIP_NAME}" .)
+          unzip -tq "$ZIP_PATH"
+          echo "ZIP: $ZIP_NAME = $(( $(stat -c %s "$ZIP_PATH") / 1024 )) KB | raw.txt = $RAW_ID"
 
-      # ============================================================
-      # ĐÓNG GÓI {slug}-SUB.zip + UPLOAD LÊN PIXELDRAIN -> lấy SUB ID (ID duy nhất bước 1 trả về)
-      # Zip chứa: vietnamese.srt, vietnamese.vtt, subtitle_geometry.json,
-      #           static_regions.json, raw.txt (chứa ID Pixeldrain của {slug}-RAW.mp4)
-      # (KHÔNG chứa video RAW; video RAW đã nằm riêng trên Pixeldrain)
-      # ============================================================
-      - name: Pack SUB zip (kèm raw.txt) and upload to Pixeldrain
-        id: pixel_sub
-        env:
-          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-          RAW_ID: ${{ steps.pixel_raw.outputs.id }}
-        run: |
-          set -euo pipefail
-          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
-          [ -n "$RAW_ID" ] || { echo '::error::Không có RAW ID từ bước upload video'; exit 1; }
-          rm -rf pack && mkdir -p pack
-          printf '%s' "$RAW_ID" > work/raw.txt
-          cp work/vietnamese.srt           pack/vietnamese.srt
-          cp work/vietnamese.vtt           pack/vietnamese.vtt
-          cp work/subtitle_geometry.json   pack/subtitle_geometry.json
-          cp work/static_regions.json      pack/static_regions.json
-          cp work/raw.txt                  pack/raw.txt
-          ZIP="${SLUG}-SUB.zip"
-          rm -f "$ZIP"
-          (cd pack && zip -0 -q -r "../$ZIP" .)
-          unzip -tq "$ZIP"
-          SIZE=$(stat -c %s "$ZIP")
-          echo "ZIP: $ZIP = $((SIZE / 1024)) KB | raw.txt = $RAW_ID"
-          ID=""
-          MAX=6
-          for attempt in $(seq 1 "$MAX"); do
-            echo "[UP] Pixeldrain attempt $attempt/$MAX"
-            rm -f work/pd_upload.json
-            code=$(curl -sS -T "$ZIP" -u ":$PD_KEY" \
-              -o work/pd_upload.json -w "%{http_code}" \
-              "https://pixeldrain.com/api/file/${ZIP}" || true)
-            echo "HTTP $code: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
-            if [ "$code" = "201" ] || [ "$code" = "200" ]; then
-              ID=$(jq -r '.id // empty' work/pd_upload.json)
-              [ -n "$ID" ] && break
-            fi
-            case "$code" in
-              401|403|413|422)
-                echo "::error::Pixeldrain từ chối (HTTP $code), không thử lại: $(head -c 300 work/pd_upload.json 2>/dev/null || true)"
-                exit 1 ;;
-            esac
-            [ "$attempt" -lt "$MAX" ] && sleep $(( attempt * 10 ))
-          done
-          [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử'; exit 1; }
-          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
-            "https://pixeldrain.com/api/file/${ID}/info")
-          remote_size=$(jq -r '.size' <<<"$info")
-          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)"
-          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local'; exit 1; }
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
-          echo "SUB Link: https://pixeldrain.com/u/${ID}"
-
-      # ============================================================
-      # BÁO VPS: chỉ 1 ID ({slug}-SUB.zip). Link cho workflow [2/3] = chính ID này.
-      # ============================================================
-      - name: Notify VPS (type=raw, pixel = SUB zip ID)
-        env:
-          SUB_ID: ${{ steps.pixel_sub.outputs.id }}
-        run: |
-          set -euo pipefail
+          SUB_ID=$(bash pd_upload.sh "$ZIP_PATH" "$ZIP_NAME")
           [ -n "$SUB_ID" ] || { echo '::error::Không có Pixeldrain SUB ID'; exit 1; }
+          printf '%s' "$SUB_ID" > "${EP_DIR}/sub_id.txt"
+          echo "SUB Link: https://pixeldrain.com/u/${SUB_ID}"
+
           curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
             -G "https://cp.ssplay.net/bili.php" \
             --data-urlencode "type=raw" \
-            --data-urlencode "slug=${SLUG}" \
+            --data-urlencode "slug=${EP_SLUG}" \
             --data-urlencode "pixel=${SUB_ID}"
           echo
-          echo "Đã báo type=raw cho VPS (slug=${SLUG}, pixel=${SUB_ID})."
-          echo "Link cho workflow [2/3]: ${SUB_ID}"
+          echo "Đã báo type=raw cho VPS (slug=${EP_SLUG}, pixel=${SUB_ID})."
+          echo "Link cho workflow [2/3] (${EP_SLUG}): ${SUB_ID}"
+          printf '%s\t%s\t%s\n' "$EP_SLUG" "$RAW_ID" "$SUB_ID" >> work/results.tsv
+          SH
+
+      # ============================================================
+      # CHẠY LẦN LƯỢT TỪNG EP (RAW đã up xong ở trên). Ep nào lỗi thì ghi nhận,
+      # vẫn chạy tiếp các ep còn lại, cuối cùng fail job nếu có ep lỗi.
+      # ============================================================
+      - name: Process each episode (OCR → translate → SUB zip → Pixeldrain → VPS)
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          OMP_NUM_THREADS: "1"
+          OCR_FAST: "1"        # 1 = tự thử chế độ nhanh (chỉ nhận dạng); 0 = luôn dùng det+rec
+          STATIC_DETECT: "1"
+        run: |
+          set -uo pipefail
+          : > work/results.tsv
+          failed=()
+          for ep_slug in $(jq -r '.[].slug' work/eps.json); do
+            echo "::group::EPISODE ${ep_slug}"
+            if bash process_episode.sh "$ep_slug"; then
+              echo "EPISODE ${ep_slug}: OK"
+            else
+              echo "::error::EPISODE ${ep_slug} THẤT BẠI (các ep khác vẫn được xử lý tiếp)"
+              failed+=("$ep_slug")
+            fi
+            echo "::endgroup::"
+          done
+          echo "================ KẾT QUẢ ================"
+          echo -e "slug\traw_id\tsub_id"
+          cat work/results.tsv
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::Các ep lỗi: ${failed[*]}"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Kết quả"
+            echo
+            echo "| slug | RAW | SUB (ID cho workflow 2/3) |"
+            echo "|---|---|---|"
+            if [ -s work/results.tsv ]; then
+              while IFS=$'\t' read -r s r b; do
+                echo "| ${s} | https://pixeldrain.com/u/${r} | ${b} |"
+              done < work/results.tsv
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup cookies
         if: always()
