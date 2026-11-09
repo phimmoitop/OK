@@ -37,7 +37,7 @@ jobs:
       LANG: "C.UTF-8"
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
       X264_PRESET: "medium"
-      X264_CRF: "21"
+      X264_CRF: "23"
       SLUG: ${{ inputs.slug }}
 
     steps:
@@ -712,7 +712,7 @@ jobs:
             -filter_complex_script work/render-filter.txt \
             -map "[v]" -map 1:a:0 \
             -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
-            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -tune animation -pix_fmt yuv420p \
+            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -tune animation -maxrate 3000k -bufsize 5000k -pix_fmt yuv420p \
             -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
             -c:a copy \
             -t "$DUR" final.mp4
