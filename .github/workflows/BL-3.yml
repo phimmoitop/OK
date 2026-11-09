@@ -477,6 +477,7 @@ jobs:
         env:
           MAX_LEVELS: "8"      # tối đa số nhánh blur (càng ít càng render nhanh, nhưng vùng blur bị gộp rộng hơn)
           SEG_PAD: "1.0"       # mỗi đoạn blur rộng thêm +-N giây quanh ranh giới đổi vị trí
+          ENHANCE: "light"     # off | light | normal | strong  (màu rực hơn + nét hơn)
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -670,6 +671,19 @@ jobs:
                   f"[{cur}][lq{k}]overlay=x={lv['x']}:y={lv['y']}:shortest=1{enable_expr(lv['iv'])}[lo{k}];"
               )
               cur = f"lo{k}"
+          # ---- Làm đẹp video (màu rực hơn + nét hơn), đặt TRƯỚC subtitles để chữ không bị ảnh hưởng ----
+          ENH = {
+              "off":    "",
+              "light":  "eq=contrast=1.04:gamma=1.03:saturation=1.10,cas=strength=0.35:planes=1",
+              "normal": "eq=contrast=1.06:gamma=1.04:saturation=1.15,cas=strength=0.50:planes=1",
+              "strong": "eq=contrast=1.08:gamma=1.06:saturation=1.22,cas=strength=0.70:planes=1",
+          }
+          enh_mode = os.environ.get("ENHANCE", "light").strip().lower()
+          enh_chain = ENH.get(enh_mode, ENH["light"])
+          print(f"ENHANCE={enh_mode} -> {enh_chain or '(không áp dụng)'}")
+          if enh_chain:
+              graph.append(f"[{cur}]{enh_chain}[ve];")
+              cur = "ve"
           graph.append(f"[{cur}]subtitles=work/vietnamese-overlay.ass[v]")
           Path("work/render-filter.txt").write_text("".join(graph) + "\n", encoding="utf-8")
           print(f"Subtitle segments (anchor): {len(segs)} | blur levels: {L}/{MAX_LEVELS}")
@@ -699,6 +713,7 @@ jobs:
             -map "[v]" -map 1:a:0 \
             -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
             -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -tune animation -pix_fmt yuv420p \
+            -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
             -c:a copy \
             -t "$DUR" final.mp4
           mkdir -p output
