@@ -559,6 +559,7 @@ jobs:
               clean_levels.append({"x": x1, "y": y1, "w": w, "h": h, "th": lv["th"],
                                    "iv": merge_iv(lv["iv"])})
           levels = clean_levels
+          for lv in levels: lv["y"] = max(0, min(lv["y"] - max(0, (100 - lv["h"]) // 2 // 2 * 2), height - max(lv["h"], 100))); lv["h"] = max(lv["h"], 100)
           if not levels:
               raise SystemExit("No valid blur level; refusing to render.")
           def feather_mask(w, h, fx, fy, path, sides=(1, 1, 1, 1)):
