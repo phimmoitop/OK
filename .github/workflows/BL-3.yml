@@ -36,7 +36,7 @@ jobs:
       LC_ALL: "C.UTF-8"
       LANG: "C.UTF-8"
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
-      X264_PRESET: "medium"
+      X264_PRESET: "fast"
       X264_CRF: "23"
       SLUG: ${{ inputs.slug }}
 
@@ -591,8 +591,8 @@ jobs:
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
           FONT_SCALE = 1.5
-          font_size = max(80, int(sub_h * .95 * FONT_SCALE))
-          font_size = min(font_size, max(80, int(width * .100 / max(1, max_chars * .50))))
+          font_size = max(90, int(sub_h * .95 * FONT_SCALE))
+          font_size = min(font_size, max(90, int(width * .100 / max(1, max_chars * .50))))
           ass = [
               "[Script Info]", "Title: Vietnamese hard subtitles",
               "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}",
