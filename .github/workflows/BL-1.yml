@@ -1407,11 +1407,16 @@ jobs:
           cat > static_detect.py <<'PY'
           """
           Phat hien lop phu CO DINH (watermark/logo) CHI O 2 GOC TREN (top-left, top-right).
-          Lay 8-16 frame NGAU NHIEN (chia deu theo thoi gian, moi doan 1 frame), tim cac diem canh
-          xuat hien o >=80% so frame VA gan nhu khong doi mau, CHI xet trong 2 goc tren.
-          Neu co watermark nam trong goc -> che FULL goc do, sat mep video.
-          Ket qua: <WORK_DIR>/static_regions.json. Loi o day KHONG lam hong workflow.
-          Bien moi truong: VIDEO (mac dinh raw_video.mp4), WORK_DIR (mac dinh work).
+          Phuong phap MOI (chiu duoc logo ban trong suot tren nen thay doi):
+            - Lay 16-30 frame rai deu theo thoi gian (ngau nhien trong tung doan), thu nho ve 800px.
+            - Tinh gradient (Sobel) tung frame, lay TRUNG VI gradient theo thoi gian tai moi pixel.
+              Nen phim thay doi -> gradient ngau nhien, trung vi ~ 0.  Logo dung yen -> gradient lap lai
+              cung dau/cung do lon o moi frame -> trung vi con nguyen => noi bat ro.
+            - Nguong tu thich nghi theo "nhieu nen" do tren vung giua khung hinh.
+          Neu co logo nam trong goc -> che FULL goc do, sat mep video.
+          Ket qua: <WORK_DIR>/static_regions.json (+ static-regions-preview.jpg, static-gradient-preview.jpg).
+          Loi o day KHONG lam hong workflow.
+          Bien moi truong: VIDEO (mac dinh raw_video.mp4), WORK_DIR (mac dinh work), STATIC_DETECT=0 de tat.
           """
           import cv2, json, math, os, random, subprocess
           import numpy as np
@@ -1419,8 +1424,9 @@ jobs:
           VIDEO = os.environ.get("VIDEO", "raw_video.mp4")
           WORK = Path(os.environ.get("WORK_DIR", "work"))
           W_SMALL = 800
-          EDGE_PRESENT = 0.80
-          STD_MAX = 10.0
+          N_MIN, N_MAX = 16, 30    # so frame lay mau
+          GRAD_MIN = 40.0          # nguong gradient trung vi toi thieu (thang Sobel 3x3, anh xam 0-255)
+          GRAD_REF_K = 2.5         # nguong = max(GRAD_MIN, K * p99 nhieu nen)
           SCAN_X = 0.35
           SCAN_Y = 0.25
           MAX_REGIONS = 4
@@ -1434,7 +1440,17 @@ jobs:
           CORNER_PAD = 0.03
           def log(msg):
               print(msg, flush=True)
-          def grab_frame(t, width, height):
+          def grab_small(t, sh):
+              """1 frame o thoi diem t, anh xam, da thu nho W_SMALL x sh."""
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
+                     "-i", VIDEO, "-frames:v", "1", "-an",
+                     "-vf", f"scale={W_SMALL}:{sh}:flags=area",
+                     "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+              out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+              if len(out) < W_SMALL * sh:
+                  return None
+              return np.frombuffer(out, np.uint8)[:W_SMALL * sh].reshape(sh, W_SMALL).astype(np.float32)
+          def grab_full(t, width, height):
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
                      "-i", VIDEO, "-frames:v", "1", "-an",
                      "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
@@ -1495,7 +1511,7 @@ jobs:
                   out.append([x1, y1, x2, y2])
               return out
           def load_sub_rects():
-              """Cac vung blur sub (da duoc lam mo roi) -> bo qua box nam gon trong do."""
+              """Cac vung blur sub -> bo qua box nam gon trong do."""
               rects = []
               gp = WORK / "subtitle_geometry.json"
               if gp.exists():
@@ -1522,64 +1538,70 @@ jobs:
               cap.release()
               if width <= 0 or height <= 0 or duration < 3:
                   return []
-              n = max(8, min(16, int(duration // 10)))
-              rng = random.Random()
+              scale = W_SMALL / float(width)
+              sh = max(2, int(round(height * scale)) // 2 * 2)
+              n = max(N_MIN, min(N_MAX, int(duration // 8)))
+              rng = random.Random(int(duration * 1000))
               times = []
               for i in range(n):
                   lo = duration * (0.03 + 0.94 * i / n)
                   hi = duration * (0.03 + 0.94 * (i + 1) / n)
                   times.append(rng.uniform(lo, hi))
-              log(f"[STATIC-OVERLAY] lay {n} frame ngau nhien: " + ", ".join(f"{t:.1f}s" for t in times))
-              scale = W_SMALL / float(width)
-              sh = max(2, int(round(height * scale)))
-              grays, edges, first_img = [], [], None
+              log(f"[STATIC-OVERLAY] video {width}x{height}, {duration:.0f}s -> lay {n} frame")
+              grays = []
               for t in times:
-                  img = grab_frame(t, width, height)
-                  if img is None:
-                      continue
-                  if first_img is None:
-                      first_img = img.copy()
-                  g = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (W_SMALL, sh), interpolation=cv2.INTER_AREA)
-                  e = cv2.Canny(cv2.GaussianBlur(g, (3, 3), 0), 40, 120)
-                  e = cv2.dilate(e, np.ones((3, 3), np.uint8)) > 0
-                  grays.append(g.astype(np.float32))
-                  edges.append(e)
+                  g = grab_small(t, sh)
+                  if g is not None:
+                      grays.append(g)
               m = len(grays)
-              if m < 5:
+              if m < 10:
                   log("[STATIC-OVERLAY] khong du frame de phan tich")
                   return []
-              stack = np.stack(grays)
-              std = stack.std(axis=0)
-              if float(std.mean()) < 2.0:
+              if float(np.stack(grays).std(axis=0).mean()) < 2.0:
                   log("[STATIC-OVERLAY] video gan nhu dung yen -> bo qua de tranh lam mo nham")
                   return []
-              count = np.sum(np.stack(edges), axis=0)
-              static = (count >= int(math.ceil(EDGE_PRESENT * m))) & (std < STD_MAX)
-              ys = np.arange(sh)[:, None]
+              # ---- trung vi gradient theo thoi gian (chi can 60% phan tren khung hinh) ----
+              top = int(0.60 * sh)
+              gxs, gys = [], []
+              for g in grays:
+                  b = cv2.GaussianBlur(g[:top], (3, 3), 0)
+                  gxs.append(cv2.Sobel(b, cv2.CV_32F, 1, 0, ksize=3))
+                  gys.append(cv2.Sobel(b, cv2.CV_32F, 0, 1, ksize=3))
+              mag = np.hypot(np.median(np.stack(gxs), axis=0), np.median(np.stack(gys), axis=0))
+              ref = mag[int(0.30 * sh):top, int(0.10 * W_SMALL):int(0.90 * W_SMALL)]
+              ref_p99 = float(np.percentile(ref, 99))
+              thr = max(GRAD_MIN, GRAD_REF_K * ref_p99)
+              ys = np.arange(top)[:, None]
               xs = np.arange(W_SMALL)[None, :]
               zone = (ys < SCAN_Y * sh) & ((xs < SCAN_X * W_SMALL) | (xs > (1 - SCAN_X) * W_SMALL))
-              static &= zone
+              static = (mag > thr) & zone
               ratio = float(static.sum()) / max(1, int(zone.sum()))
-              log(f"[STATIC-OVERLAY] pixel tinh trong 2 goc tren: {ratio * 100:.2f}%")
-              if ratio > 0.25:
+              log(f"[STATIC-OVERLAY] nhieu nen p99={ref_p99:.1f} -> nguong={thr:.1f} | "
+                  f"diem tinh trong 2 goc tren: {ratio * 100:.2f}% | max={float(mag[zone].max()):.0f}")
+              # anh gradient de kiem tra bang mat
+              try:
+                  hm = np.clip(mag / (thr * 3.0) * 255.0, 0, 255).astype(np.uint8)
+                  cv2.imwrite(str(WORK / "static-gradient-preview.jpg"), cv2.applyColorMap(hm, cv2.COLORMAP_INFERNO))
+              except Exception:
+                  pass
+              if ratio > 0.30:
                   log("[STATIC-OVERLAY] ty le tinh qua cao (canh quay co dinh?) -> bo qua")
                   return []
-              k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, int(W_SMALL * 0.03)), 5))
-              closed = cv2.morphologyEx(static.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k)
+              k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, int(W_SMALL * 0.05)), 9))
+              mask = cv2.dilate(static.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=2)
+              closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
               nlab, _, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
               boxes = []
               for i in range(1, nlab):
                   x, y, w, h, _a = stats[i]
                   pix = int(static[y:y + h, x:x + w].sum())
-                  if w < 10 or h < 6 or pix < 25:
+                  if w < 10 or h < 8 or pix < 20:
                       continue
                   if w * h > 0.12 * sh * W_SMALL:
                       continue
-                  if pix / float(w * h) < 0.04:
+                  if h <= 12 and w >= 0.08 * W_SMALL:      # duong ke ngang dai (vien letterbox...) khong phai logo
                       continue
-                  if w > 0.6 * W_SMALL and h < 0.04 * sh:
-                      continue
-                  if h > 0.6 * sh and w < 0.04 * W_SMALL:
+                  if w <= 12 and h >= 0.10 * sh:           # duong doc dai
                       continue
                   boxes.append([x - 4, y - 4, x + w + 4, y + h + 4])
               boxes = merge_boxes(boxes, gap=int(W_SMALL * 0.04))
@@ -1618,11 +1640,12 @@ jobs:
               if sum(r["w"] * r["h"] for r in regions) > 0.30 * width * height:
                   log("[STATIC-OVERLAY] tong dien tich qua lon -> bo qua")
                   return []
-              if regions and first_img is not None:
-                  for r in regions:
-                      cv2.rectangle(first_img, (r["x"], r["y"]), (r["x"] + r["w"], r["y"] + r["h"]),
-                                    (255, 0, 255), 3)
-                  cv2.imwrite(str(WORK / "static-regions-preview.jpg"), first_img)
+              if regions:
+                  img = grab_full(duration / 2.0, width, height)
+                  if img is not None:
+                      for r in regions:
+                          cv2.rectangle(img, (r["x"], r["y"]), (r["x"] + r["w"], r["y"] + r["h"]), (255, 0, 255), 3)
+                      cv2.imwrite(str(WORK / "static-regions-preview.jpg"), img)
               for r in regions:
                   log(f"[STATIC-OVERLAY] che: x={r['x']} y={r['y']} w={r['w']} h={r['h']} feather={r['feather']}")
               if not regions:
