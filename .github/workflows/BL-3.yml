@@ -475,9 +475,9 @@ jobs:
       # ============================================================
       - name: Render Vietnamese video and HLS with per-anchor subtitle blur
         env:
-          MAX_LEVELS: "8"      # tối đa số nhánh blur (càng ít càng render nhanh, nhưng vùng blur bị gộp rộng hơn)
+          MAX_LEVELS: "4"      # tối đa số nhánh blur (càng ít càng render nhanh, nhưng vùng blur bị gộp rộng hơn)
           SEG_PAD: "1.0"       # mỗi đoạn blur rộng thêm +-N giây quanh ranh giới đổi vị trí
-          ENHANCE: "light"     # off | light | normal | strong  (màu rực hơn + nét hơn)
+          ENHANCE: "off"     # off | light | normal | strong  (màu rực hơn + nét hơn)
         run: |
           set -euo pipefail
           python3 <<'PY'
