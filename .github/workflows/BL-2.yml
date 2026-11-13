@@ -121,7 +121,7 @@ jobs:
       - name: TTS Generation (Revid TTS API + Vietnamese VTT)
         env:
           REVID_API_KEYS: ${{ secrets.REVID_API_KEYS }}   # mỗi dòng 1 key
-          REVID_VOICE_ID: "9034"  # 3001
+          REVID_VOICE_ID: "3001"  # 3001
           REVID_LANGUAGE: "vi-VN"
           REVID_RATE: "0%"
           TTS_WORKERS: "4"
