@@ -521,7 +521,7 @@ jobs:
           # Báo về ViCDN khi deploy thành công (dùng chung cho cả 2 lần check)
           notify () {
             curl -G "https://cp.ssplay.net/bili.php" \
-              --data-urlencode "type=ok0" \
+              --data-urlencode "type=tm1" \
               --data-urlencode "key=${PROJECT}" \
               --data-urlencode "slug=${BRANCH}" || true
             curl -L -A "MySecretAgent_ViCDN_cc" "https://vicdn.cc/${BRANCH}?r=1" || true
