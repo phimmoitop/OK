@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "SUBID (hoặc AUDIOID-SUB-SUBID, phần AUDIOID sẽ bị bỏ qua)"
+        description: "SUBID (hoặc AUDIOID-REN-SUBID, phần AUDIOID sẽ bị bỏ qua)"
         required: true
         type: string
       slug:
@@ -48,7 +48,7 @@ jobs:
 
       # ============================================================
       # LẤY SUB_ID từ input "link"
-      #   - Chấp nhận "SUBID" hoặc dạng cũ "AUDIOID-SUB-SUBID" (bỏ phần AUDIOID)
+      #   - Chấp nhận "SUBID" hoặc dạng cũ "AUDIOID-REN-SUBID" (bỏ phần AUDIOID)
       # RAW_ID sẽ lấy từ raw.txt nằm trong SUB zip
       # ============================================================
       - name: Validate inputs and get SUB ID
@@ -58,8 +58,8 @@ jobs:
           set -euo pipefail
           [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
           LINK="$(echo -n "$LINK" | tr -d '[:space:]')"
-          if [[ "$LINK" == *-SUB-* ]]; then
-            SUB_ID="${LINK#*-SUB-}"
+          if [[ "$LINK" == *-REN-* ]]; then
+            SUB_ID="${LINK#*-REN-}"
           else
             SUB_ID="$LINK"
           fi
