@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "SUBID (hoặc AUDIOID-REN-SUBID, phần AUDIOID sẽ bị bỏ qua)"
+        description: "RAWID-REN-SUBID-AUDIOID"
         required: true
         type: string
       slug:
@@ -47,26 +47,23 @@ jobs:
           persist-credentials: false
 
       # ============================================================
-      # LẤY SUB_ID từ input "link"
-      #   - Chấp nhận "SUBID" hoặc dạng cũ "AUDIOID-REN-SUBID" (bỏ phần AUDIOID)
-      # RAW_ID sẽ lấy từ raw.txt nằm trong SUB zip
+      # Link: RAWID-REN-SUBID-AUDIOID
       # ============================================================
-      - name: Validate inputs and get SUB ID
+      - name: Validate inputs and split link
         env:
           LINK: ${{ inputs.link }}
         run: |
           set -euo pipefail
           [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
           LINK="$(echo -n "$LINK" | tr -d '[:space:]')"
-          if [[ "$LINK" == *-REN-* ]]; then
-            SUB_ID="${LINK#*-REN-}"
-          else
-            SUB_ID="$LINK"
-          fi
-          [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo '::error::SUB ID không hợp lệ'; exit 1; }
+          [[ "$LINK" =~ ^([A-Za-z0-9_-]+)-REN-([A-Za-z0-9_-]+)-([A-Za-z0-9_-]+)$ ]] || { echo '::error::link phải có dạng RAWID-REN-SUBID-AUDIOID'; exit 1; }
+          RAW_ID="${BASH_REMATCH[1]}"
+          SUB_ID="${BASH_REMATCH[2]}"
+          AUDIO_ID="${BASH_REMATCH[3]}"
+          echo "RAW_ID=$RAW_ID" >> "$GITHUB_ENV"
           echo "SUB_ID=$SUB_ID" >> "$GITHUB_ENV"
-          echo "SUB   ({slug}-SUB.zip: sub + geometry + static + raw.txt) = $SUB_ID"
-          echo "RAW   ({slug}-RAW.mp4) = lấy ID từ raw.txt trong SUB zip"
+          echo "AUDIO_ID=$AUDIO_ID" >> "$GITHUB_ENV"
+          echo "RAW=$RAW_ID | SUB=$SUB_ID | AUDIO=$AUDIO_ID (AUDIO ID được giữ trong link, không dùng ở bước render)"
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -174,23 +171,19 @@ jobs:
           set -euo pipefail
           source pd_get.sh
 
-          # ---- {slug}-SUB.zip: sub + geometry + static + raw.txt ----
+          # ---- {slug}-SUB.zip: sub + geometry + static ----
           pd_get "$SUB_ID" sub.zip zip
           unzip -o -q sub.zip -d dl_sub
-          for f in vietnamese.srt vietnamese.vtt subtitle_geometry.json static_regions.json raw.txt; do
+          for f in vietnamese.srt vietnamese.vtt subtitle_geometry.json static_regions.json; do
             [ -s "dl_sub/$f" ] || { echo "::error::Trong SUB zip thiếu file '$f' (có chắc ID là {slug}-SUB.zip của bước 1?)"; exit 1; }
           done
-          RAW_ID="$(tr -d '[:space:]' < dl_sub/raw.txt)"
-          [[ "$RAW_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::raw.txt không chứa ID hợp lệ: '$RAW_ID'"; exit 1; }
-          echo "RAW_ID=$RAW_ID" >> "$GITHUB_ENV"
-          echo "RAW ID (từ raw.txt) = $RAW_ID"
           mv dl_sub/vietnamese.srt dl_sub/vietnamese.vtt \
              dl_sub/subtitle_geometry.json dl_sub/static_regions.json work/
 
           rm -rf dl_sub sub.zip
           ls -lh work/
 
-      - name: Download RAW video from Pixeldrain (ID lấy từ raw.txt)
+      - name: Download RAW video from Pixeldrain (ID lấy trực tiếp từ input)
         timeout-minutes: 90
         env:
           PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
