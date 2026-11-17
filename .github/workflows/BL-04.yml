@@ -1,4 +1,4 @@
-name: "NEW VS [04/04] SUB → HLS"
+name: "NEW [04/04] VS SUB → HLS"
 
 on:
   workflow_dispatch:
