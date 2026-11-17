@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "Pixeldrain RAW ID dạng <id>-RAW (ví dụ cG27aCed-RAW)"
+        description: "RAWID-RAW"
         required: true
         type: string
       slug:
