@@ -1,4 +1,4 @@
-name: "NEW [1/3] Bili → RAW → SUB"
+name: "OLD [1/3] Bili → RAW → SUB"
 
 on:
   workflow_dispatch:
