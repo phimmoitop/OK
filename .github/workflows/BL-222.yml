@@ -1,4 +1,4 @@
-name: "NEW [2/4] SUB → TTS"
+name: "OLD [2/4] SUB → TTS"
 
 on:
   workflow_dispatch:
