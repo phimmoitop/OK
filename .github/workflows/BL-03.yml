@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "AUDIOID-SUB-SUBID"
+        description: "RAWID-AUDIO-SUBID-AUDIOID"
         required: true
         type: string
       slug:
@@ -44,8 +44,7 @@ jobs:
           persist-credentials: false
 
       # ============================================================
-      # TÁCH LINK "AUDIOID-SUB-SUBID" -> AUDIO_ID (zip bước 2) + SUB_ID (zip bước 1)
-      # RAW_ID sẽ lấy từ raw.txt nằm trong SUB zip
+      # Link: RAWID-AUDIO-SUBID-AUDIOID
       # ============================================================
       - name: Validate inputs and split link
         env:
@@ -54,16 +53,14 @@ jobs:
           set -euo pipefail
           [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
           LINK="$(echo -n "$LINK" | tr -d '[:space:]')"
-          [[ "$LINK" == *-SUB-* ]] || { echo '::error::link phải có dạng AUDIOID-SUB-SUBID (vd: sT1sbAuW-SUB-htUT5prY)'; exit 1; }
-          AUDIO_ID="${LINK%%-SUB-*}"
-          SUB_ID="${LINK#*-SUB-}"
-          [[ "$AUDIO_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo '::error::AUDIO ID không hợp lệ'; exit 1; }
-          [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]+$ ]]   || { echo '::error::SUB ID không hợp lệ'; exit 1; }
-          echo "AUDIO_ID=$AUDIO_ID" >> "$GITHUB_ENV"
+          [[ "$LINK" =~ ^([A-Za-z0-9_-]+)-AUDIO-([A-Za-z0-9_-]+)-([A-Za-z0-9_-]+)$ ]] || { echo '::error::link phải có dạng RAWID-AUDIO-SUBID-AUDIOID'; exit 1; }
+          RAW_ID="${BASH_REMATCH[1]}"
+          SUB_ID="${BASH_REMATCH[2]}"
+          AUDIO_ID="${BASH_REMATCH[3]}"
+          echo "RAW_ID=$RAW_ID" >> "$GITHUB_ENV"
           echo "SUB_ID=$SUB_ID" >> "$GITHUB_ENV"
-          echo "AUDIO ({slug}-AUDIO.zip: c_*.mp3)                         = $AUDIO_ID"
-          echo "SUB   ({slug}-SUB.zip: sub + geometry + static + raw.txt) = $SUB_ID"
-          echo "RAW   ({slug}-RAW.mp4) = lấy ID từ raw.txt trong SUB zip"
+          echo "AUDIO_ID=$AUDIO_ID" >> "$GITHUB_ENV"
+          echo "RAW=$RAW_ID | SUB=$SUB_ID | AUDIO=$AUDIO_ID"
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -154,8 +151,7 @@ jobs:
           SH
 
       # ============================================================
-      # TẢI SUB.zip (bước 1) + AUDIO.zip (bước 2)
-      # (geometry / static_regions không còn dùng ở bước này vì không render lại video)
+      # TẢI SUB.zip + AUDIO.zip; RAW_ID lấy trực tiếp từ input
       # ============================================================
       - name: Download SUB zip + AUDIO zip and extract
         timeout-minutes: 60
@@ -165,30 +161,24 @@ jobs:
           set -euo pipefail
           source pd_get.sh
 
-          # ---- (1) {slug}-SUB.zip: sub + raw.txt (+ geometry/static, không dùng) ----
           pd_get "$SUB_ID" sub.zip zip
           unzip -o -q sub.zip -d dl_sub
-          for f in vietnamese.srt vietnamese.vtt raw.txt; do
-            [ -s "dl_sub/$f" ] || { echo "::error::Trong SUB zip thiếu file '$f' (có chắc ID sau -SUB- là {slug}-SUB.zip của bước 1?)"; exit 1; }
+          for f in vietnamese.srt vietnamese.vtt; do
+            [ -s "dl_sub/$f" ] || { echo "::error::Trong SUB zip thiếu file '$f' (SUB ID bước 1 không đúng?)"; exit 1; }
           done
-          RAW_ID="$(tr -d '[:space:]' < dl_sub/raw.txt)"
-          [[ "$RAW_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::raw.txt không chứa ID hợp lệ: '$RAW_ID'"; exit 1; }
-          echo "RAW_ID=$RAW_ID" >> "$GITHUB_ENV"
-          echo "RAW ID (từ raw.txt) = $RAW_ID"
           mv dl_sub/vietnamese.srt dl_sub/vietnamese.vtt work/
 
-          # ---- (2) {slug}-AUDIO.zip: chunks c_*.mp3 (chỉ số = thứ tự cue trong vtt) ----
           pd_get "$AUDIO_ID" audio.zip zip
           mkdir -p chunks
           unzip -o -q audio.zip -d chunks
           N=$(ls chunks/c_*.mp3 2>/dev/null | wc -l)
-          [ "$N" -gt 0 ] || { echo "::error::AUDIO zip không có file c_*.mp3 nào (có chắc ID trước -SUB- là {slug}-AUDIO.zip của bước 2?)"; exit 1; }
-          echo "AUDIO: $N file mp3"
+          [ "$N" -gt 0 ] || { echo '::error::AUDIO zip không có file c_*.mp3 nào'; exit 1; }
+          echo "AUDIO: $N file"
 
           rm -rf dl_sub sub.zip audio.zip
           ls -lh work/
 
-      - name: Download RAW video from Pixeldrain (ID lấy từ raw.txt)
+      - name: Download RAW video from Pixeldrain (ID lấy trực tiếp từ input)
         timeout-minutes: 90
         env:
           PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
