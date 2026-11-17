@@ -50,10 +50,13 @@ jobs:
             command -v "$c" >/dev/null || { echo "::error::Runner thiếu '$c' (thêm: sudo apt-get install -y $c)"; exit 1; }
           done
           [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
-          SUB_ID="$(echo -n "$LINK" | tr -d '[:space:]')"
-          [[ "$SUB_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo '::error::link phải là ID Pixeldrain của {slug}-SUB.zip (bước 1)'; exit 1; }
+          LINK="$(echo -n "$LINK" | tr -d '[:space:]')"
+          [[ "$LINK" =~ ^([A-Za-z0-9_-]+)-SUB-([A-Za-z0-9_-]+)$ ]] || { echo '::error::link phải có dạng RAWID-SUB-SUBID'; exit 1; }
+          RAW_ID="${BASH_REMATCH[1]}"
+          SUB_ID="${BASH_REMATCH[2]}"
+          echo "RAW_ID=$RAW_ID" >> "$GITHUB_ENV"
           echo "SUB_ID=$SUB_ID" >> "$GITHUB_ENV"
-          echo "SUB zip = $SUB_ID"
+          echo "RAW=$RAW_ID | SUB zip=$SUB_ID"
           [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
           code=$(curl -s -o /tmp/pd_user.json -w "%{http_code}" --retry 3 --retry-all-errors \
             -u ":$PD_KEY" "https://pixeldrain.com/api/user" || true)
@@ -435,9 +438,9 @@ jobs:
           [ -n "$AUDIO_ID" ] || { echo '::error::Không có Pixeldrain AUDIO ID'; exit 1; }
           curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
             -G "https://cp.ssplay.net/bili.php" \
-            --data-urlencode "type=sub" \
+            --data-urlencode "type=tts" \
             --data-urlencode "slug=${SLUG}" \
             --data-urlencode "pixel=${AUDIO_ID}"
           echo
           echo "Đã báo type=sub cho VPS (slug=${SLUG}, pixel=${AUDIO_ID})."
-          echo "Link cho workflow [3/3]: ${AUDIO_ID}-SUB-${SUB_ID}"
+          echo "Link cho workflow [3/4]: ${RAW_ID}-AUDIO-${SUB_ID}-${AUDIO_ID}"
