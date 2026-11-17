@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: "SUB ID"
+        description: "RAWID-SUB-SUBID"
         required: true
         type: string
       slug:
