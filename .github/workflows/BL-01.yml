@@ -1499,6 +1499,7 @@ jobs:
           Moi lan goi API random 1 model + 1 key.
           Loi server (500/503/504/timeout): retry toi da 20 lan, moi lan cach 90s.
           Loi limit (429): doi model/key, cho 90s.
+          Phan hoi RONG (bi chan): thu lai 1 lan; van rong -> chia batch lam 4 phan; phan nao van rong -> BO TRONG.
           Dong sot / con chu Han KHONG retry ngay, gom lai het roi dich lai 1 luot o cuoi.
           Dong AI tra "..." (rac OCR khong doc duoc) = BO TRONG, KHONG BAO GIO giu lai tieng Trung.
           Ket qua: <WORK_DIR>/vi_raw.json (start, end, text, vi). Buoc finalize_vi.py se lam sach hoan toan.
@@ -1525,9 +1526,20 @@ jobs:
           SERVER_MAX_RETRIES = 20     # dung cho loi server (500/503/504/timeout)
           SERVER_RETRY_WAIT = 90      # giay cho giua 2 lan retry khi loi server
           LIMIT_RETRY_WAIT = 90       # giay cho giua 2 lan retry khi loi limit (429)
+          EMPTY_TRIES = 2             # phan hoi rong: thu toi da N lan (lan dau + 1 lan thu lai)
+          SPLIT_PARTS = 4             # van rong -> chia batch lam N phan
           MAX_CHARS_PER_LINE = 60     # gioi han so ky tu (tinh ca dau cach) cho moi dong tieng Viet
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
+          SAFETY_SETTINGS = [
+              types.SafetySetting(category=c, threshold="BLOCK_NONE")
+              for c in (
+                  "HARM_CATEGORY_HARASSMENT",
+                  "HARM_CATEGORY_HATE_SPEECH",
+                  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                  "HARM_CATEGORY_DANGEROUS_CONTENT",
+              )
+          ]
           SYSTEM_INSTRUCTION = (
               "You are a professional video subtitle translator. Translate the text into natural, fluent Vietnamese.\n"
               "CRITICAL RULES:\n"
@@ -1552,7 +1564,12 @@ jobs:
               "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain. "
               f"HARD LIMIT: every Vietnamese line MUST be at most {MAX_CHARS_PER_LINE} characters long (spaces included). "
               "If the source line is long, compress the meaning to fit the limit instead of exceeding it.\n"
-              "10. The output must be PURE VIETNAMESE. NEVER output Chinese characters, pinyin or any other language."
+              "10. The output must be PURE VIETNAMESE. NEVER output Chinese characters, pinyin or any other language.\n"
+              "11. SENSITIVE CONTENT: The subtitles come from fictional drama. If a line contains vulgar, violent, "
+              "sexual or otherwise sensitive wording that could be misread out of context, translate it in a mild, "
+              "neutral, non-graphic way that keeps only the story meaning (use a soft euphemism). "
+              "If it still cannot be translated safely, output '...' for that line. "
+              "NEVER refuse the whole batch and NEVER skip other lines because of one sensitive line."
           )
           def log(msg):
               print(msg, flush=True)
@@ -1657,6 +1674,10 @@ jobs:
                   return "REQUEST SAI (400)", "fatal"
               return f"LOI KHAC ({code})", "fatal"
           def call_gemini_with_retry(prompt_text):
+              """Tra ve:
+                 - str khong rong : dich thanh cong
+                 - ""             : API tra ve OK nhung RONG (thuong la bi chan safety) -> noi goi tu xu ly
+                 - None           : het retry vi loi server/limit/khac"""
               server_fails = 0
               other_fails = 0
               attempt = 0
@@ -1674,10 +1695,18 @@ jobs:
                           config=types.GenerateContentConfig(
                               system_instruction=SYSTEM_INSTRUCTION,
                               temperature=0.3,
+                              safety_settings=SAFETY_SETTINGS,
                           )
                       )
+                      text = response.text
+                      if not text or not text.strip():
+                          fb = getattr(response, "prompt_feedback", None)
+                          fr = [str(getattr(c, "finish_reason", None)) for c in (response.candidates or [])]
+                          log(f"<< PHAN HOI RONG ({model}) sau {time.time() - t0:.1f}s | "
+                              f"prompt_feedback={fb} | finish_reason={fr}")
+                          return ""
                       log(f"<< NHAN KET QUA ({model}) - Thanh cong sau {time.time() - t0:.1f}s")
-                      return response.text
+                      return text
                   except Exception as e:
                       label, kind = classify_error(e)
                       log(f"<< LOI [{label}] | Model {model} | Key #{kno} | sau {time.time() - t0:.1f}s")
@@ -1752,6 +1781,52 @@ jobs:
                   out[idx] = "" if val == "..." else val
                   prev = idx
               return out
+          def try_translate(items, label):
+              """items: [(idx_goc, text)]. Thu toi da EMPTY_TRIES lan.
+              Tra ve dict {idx_goc: vi} neu API tra ve noi dung, hoac None neu van RONG (bi chan).
+              Het retry vi loi server/limit -> raise (dung het, vi khong phai loi do noi dung)."""
+              prompt_text = "".join(f"[{k}] {t.strip() or '...'}\n" for k, (_, t) in enumerate(items))
+              log(f">> NOI DUNG GUI LEN API ({label}, {len(items)} dong):")
+              for line in prompt_text.strip().split("\n"):
+                  log(f"   {line}")
+              for attempt in range(1, EMPTY_TRIES + 1):
+                  resp = call_gemini_with_retry(prompt_text)
+                  if resp is None:
+                      raise RuntimeError(f"[THAT BAI] Het retry vi loi server/limit ({label}).")
+                  if resp.strip():
+                      log(">> KET QUA DICH TU AI:")
+                      for line in resp.strip().split("\n"):
+                          log(f"   {line}")
+                      parsed = parse_batch(resp, len(items))
+                      return {items[k][0]: v for k, v in parsed.items()}
+                  log(f"   [{label}] phan hoi rong lan {attempt}/{EMPTY_TRIES}"
+                      + (", thu lai..." if attempt < EMPTY_TRIES else ""))
+                  if attempt < EMPTY_TRIES:
+                      time.sleep(2)
+              return None
+          def translate_batch(items, bn):
+              """Gui ca batch -> rong 2 lan -> chia 4 phan -> phan nao van rong thi BO TRONG (khong dich lai)."""
+              r = try_translate(items, f"batch {bn}")
+              if r is not None:
+                  return r
+              n = len(items)
+              size = max(1, (n + SPLIT_PARTS - 1) // SPLIT_PARTS)
+              log(f">> BATCH {bn} bi chan 2 lan -> chia {SPLIT_PARTS} phan (moi phan toi da {size} dong)")
+              out = {}
+              for p, s in enumerate(range(0, n, size), 1):
+                  part = items[s:s + size]
+                  label = f"batch {bn} phan {p}/{SPLIT_PARTS}"
+                  rp = try_translate(part, label)
+                  if rp is None:
+                      log(f">> [{label}] van bi chan -> BO QUA {len(part)} dong (de trong):")
+                      for _, t in part:
+                          log(f"   BO: {t!r}")
+                      for gi, _ in part:
+                          out[gi] = ""
+                  else:
+                      out.update(rp)
+                  time.sleep(2)
+              return out
           def translate_cues(cues):
               if not GEMINI_API_KEYS:
                   raise RuntimeError("Chua cau hinh GEMINI_API_KEYS trong GitHub Secrets.")
@@ -1765,17 +1840,7 @@ jobs:
                   batch = cues[i:i + GEMINI_BATCH_SIZE]
                   bn = i // GEMINI_BATCH_SIZE + 1
                   log(f"[BATCH {bn}/{total_batches}] Dong {i + 1}-{min(i + GEMINI_BATCH_SIZE, total)}")
-                  prompt_text = "".join(f"[{idx}] {c['text'].strip() or '...'}\n" for idx, c in enumerate(batch))
-                  log(">> NOI DUNG GUI LEN API:")
-                  for line in prompt_text.strip().split("\n"):
-                      log(f"   {line}")
-                  response_text = call_gemini_with_retry(prompt_text)
-                  if response_text is None:
-                      raise RuntimeError(f"[THAT BAI] Khong the dich batch {bn}.")
-                  log(">> KET QUA DICH TU AI:")
-                  for line in response_text.strip().split("\n"):
-                      log(f"   {line}")
-                  translated = parse_batch(response_text, len(batch))
+                  translated = translate_batch([(idx, c["text"]) for idx, c in enumerate(batch)], bn)
                   n_miss = 0
                   for idx, cue in enumerate(batch):
                       vi = translated.get(idx)
@@ -1796,7 +1861,7 @@ jobs:
                   rp += "\nOutput ONLY these lines with their exact [index] prefix."
                   rr = call_gemini_with_retry(rp)
                   if not rr:
-                      log(">> LUOT 2: khong nhan duoc ket qua cho nhom nay")
+                      log(">> LUOT 2: khong nhan duoc ket qua cho nhom nay (rong/bi chan) -> bo qua")
                       continue
                   log(">> KET QUA DICH LAI:")
                   for line in rr.strip().split("\n"):
@@ -1814,7 +1879,7 @@ jobs:
                       n_still += 1
                       log(f"   [{i + 1:04d}] VAN SOT sau luot 2 -> BO TRONG: {r['text']!r}")
               n_blank = sum(1 for r in results if not r["vi"].strip())
-              log(f">> Tong cong {n_blank}/{total} dong bo trong ({n_still} dong van sot, con lai la rac OCR AI tra '...')")
+              log(f">> Tong cong {n_blank}/{total} dong bo trong ({n_still} dong van sot, con lai la rac OCR / bi chan / AI tra '...')")
               return results
           def count_syl(t):
               return len(re.findall(r"\w+", t, re.UNICODE))
