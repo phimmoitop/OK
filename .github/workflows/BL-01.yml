@@ -142,7 +142,6 @@ jobs:
           GEMINI_MODELS = [
               "gemma-4-26b-a4b-it",
               "gemma-4-31b-it",
-              "gemini-3.5-flash-lite",
           ]
           GEMINI_BATCH_SIZE = 200
           GEMINI_MAX_RETRIES = 10     # dung cho loi limit (429) va loi khac (404/400/401/403)
