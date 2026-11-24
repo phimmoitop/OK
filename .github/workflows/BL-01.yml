@@ -143,10 +143,10 @@ jobs:
               "gemma-4-26b-a4b-it",
               "gemma-4-31b-it",
           ]
-          GEMINI_BATCH_SIZE = 200
+          GEMINI_BATCH_SIZE = 50
           GEMINI_MAX_RETRIES = 10     # dung cho loi limit (429) va loi khac (404/400/401/403)
-          SERVER_MAX_RETRIES = 20     # dung cho loi server (500/503/504/timeout)
-          SERVER_RETRY_WAIT = 90      # giay cho giua 2 lan retry khi loi server
+          SERVER_MAX_RETRIES = 30     # dung cho loi server (500/503/504/timeout)
+          SERVER_RETRY_WAIT = 30      # giay cho giua 2 lan retry khi loi server
           LIMIT_RETRY_WAIT = 90       # giay cho giua 2 lan retry khi loi limit (429)
           EMPTY_TRIES = 2             # phan hoi rong: thu toi da N lan (lan dau + 1 lan thu lai)
           SPLIT_PARTS = 4             # van rong -> chia batch lam N phan
