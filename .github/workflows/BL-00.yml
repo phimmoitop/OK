@@ -75,7 +75,16 @@ jobs:
           # Kiểm tra xung đột thư viện: tất cả phải import được cùng nhau
           python3 <<'PY'
           import cv2, pysubs2, numpy, requests
-          from rapidocr import RapidOCR
+          from rapidocr import EngineType, LangRec, ModelType, OCRVersion, RapidOCR
+          # Validate config typing before starting the multiprocessing OCR phase.
+          RapidOCR(params={
+              "Rec.engine_type": EngineType.ONNXRUNTIME,
+              "Rec.lang_type": LangRec.CH,
+              "Rec.model_type": ModelType.SMALL,
+              "Rec.ocr_version": OCRVersion.PPOCRV6,
+              "Rec.rec_img_shape": [3, 48, 2048],
+              "Rec.rec_batch_num": 1,
+          })
           print("ALL IMPORTS OK")
           PY
 
@@ -419,13 +428,13 @@ jobs:
               global _ENGINE
               if _ENGINE is not None:
                   return _ENGINE
-              from rapidocr import RapidOCR
+              from rapidocr import EngineType, LangRec, ModelType, OCRVersion, RapidOCR
               # PP-OCRv6 small giu toc do; rong 2048 de khong ep dong sub dai vao 320px.
               _ENGINE = RapidOCR(params={
-                  "Rec.engine_type": "onnxruntime",
-                  "Rec.lang_type": "ch",
-                  "Rec.model_type": "small",
-                  "Rec.ocr_version": "PP-OCRv6",
+                  "Rec.engine_type": EngineType.ONNXRUNTIME,
+                  "Rec.lang_type": LangRec.CH,
+                  "Rec.model_type": ModelType.SMALL,
+                  "Rec.ocr_version": OCRVersion.PPOCRV6,
                   "Rec.rec_img_shape": [3, 48, 2048],
                   "Rec.rec_batch_num": 1,
               })
