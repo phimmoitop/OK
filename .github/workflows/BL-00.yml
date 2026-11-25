@@ -1593,9 +1593,10 @@ jobs:
       - name: Create Bilibili subtitle fetcher
         run: |
           cat > bilibili_subtitles.py <<'PY'
-          import http.cookiejar, json, os, re, subprocess, sys
+          import hashlib, http.cookiejar, json, os, re, subprocess, sys, time
           from pathlib import Path
           from difflib import SequenceMatcher
+          from urllib.parse import urlencode
           import requests
           import pysubs2
 
@@ -1631,6 +1632,26 @@ jobs:
                   raise ValueError("Unexpected Bilibili API response")
               return data
 
+          def signed_player_params(params):
+              nav = get_json("https://api.bilibili.com/x/web-interface/nav", {})
+              wbi = ((nav.get("data") or {}).get("wbi_img") or {})
+              img_url, sub_url = wbi.get("img_url", ""), wbi.get("sub_url", "")
+              if not img_url or not sub_url:
+                  raise ValueError(f"Could not obtain WBI signing keys (nav code={nav.get('code')})")
+              image_key = img_url.rsplit("/", 1)[-1].split(".", 1)[0]
+              sub_key = sub_url.rsplit("/", 1)[-1].split(".", 1)[0]
+              source = image_key + sub_key
+              mixin_table = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,
+                             33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,
+                             61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,
+                             36,20,34,44,52]
+              mixin_key = "".join(source[i] for i in mixin_table)[:32]
+              signed = {k: "".join(ch for ch in str(v) if ch not in "!'()*")
+                        for k, v in sorted({**params, "wts": int(time.time())}.items())}
+              query = urlencode(signed)
+              signed["w_rid"] = hashlib.md5((query + mixin_key).encode()).hexdigest()
+              return signed
+
           try:
               pages_resp = get_json("https://api.bilibili.com/x/player/pagelist", {"bvid": bvid})
               page_list = pages_resp.get("data")
@@ -1648,11 +1669,14 @@ jobs:
                   raise ValueError(f"Bilibili page duration {bili_duration:.2f}s does not match RAW {raw_duration:.2f}s")
               print(f"[BILI-SUB] Resolved {bvid} page={page} cid={cid} | Bilibili duration={bili_duration:.2f}s RAW={raw_duration:.2f}s", flush=True)
 
-              player = get_json("https://api.bilibili.com/x/player/v2", {"bvid": bvid, "cid": cid})
+              player = get_json("https://api.bilibili.com/x/player/wbi/v2",
+                                signed_player_params({"bvid": bvid, "cid": cid}))
               payload = player.get("data") or {}
               tracks = ((payload.get("subtitle") or {}).get("subtitles") or [])
               if not tracks:
-                  raise ValueError("No subtitle tracks returned (may require a Bilibili login)")
+                  if payload.get("need_login_subtitle"):
+                      raise ValueError("Bilibili marks subtitles as login-required; verify BILIBILI_COOKIES has a valid, unexpired SESSDATA")
+                  raise ValueError(f"No subtitle tracks in WBI response (API code={player.get('code')}, message={player.get('message')})")
               preference = {"ai-zh": 0, "zh-CN": 1, "zh-Hans": 2, "zh-Hant": 3, "zh": 4}
               tracks = [t for t in tracks if isinstance(t, dict) and t.get("subtitle_url") and
                         (str(t.get("lan", "")).lower().startswith("zh") or str(t.get("lan", "")).lower() == "ai-zh")]
