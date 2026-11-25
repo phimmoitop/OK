@@ -136,7 +136,34 @@ jobs:
           set -euo pipefail
           if [ -n "${BILIBILI_COOKIES:-}" ]; then
             printf '%s' "$BILIBILI_COOKIES" > work/bilibili-cookie-input.txt
-            python3 tools/prepare_cookies.py work/bilibili-cookie-input.txt work/bilibili-cookies.txt
+            python3 - work/bilibili-cookie-input.txt work/bilibili-cookies.txt <<'PYCOOKIES'
+          import os, re, sys
+          from pathlib import Path
+          src, dst = map(Path, sys.argv[1:3])
+          raw = src.read_text(encoding="utf-8").strip()
+          if not raw:
+              raise SystemExit("Cookie input is empty")
+          if raw.startswith(("# Netscape HTTP Cookie File", "# HTTP Cookie File")):
+              dst.write_text(raw + ("\n" if not raw.endswith("\n") else ""), encoding="utf-8")
+          else:
+              pairs = []
+              for part in raw.split(";"):
+                  part = part.strip()
+                  if "=" not in part:
+                      continue
+                  name, value = part.split("=", 1)
+                  name, value = name.strip(), value.strip()
+                  if re.fullmatch(r"[A-Za-z0-9_]+", name) and value:
+                      pairs.append((name, value))
+              if not pairs:
+                  raise SystemExit("Cookie input is neither Netscape format nor a Cookie header")
+              with dst.open("w", encoding="utf-8") as f:
+                  f.write("# Netscape HTTP Cookie File\n")
+                  for name, value in pairs:
+                      f.write(f".bilibili.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
+          os.chmod(dst, 0o600)
+          print("Cookie file prepared (values hidden).")
+          PYCOOKIES
             rm -f work/bilibili-cookie-input.txt
             echo "Prepared optional Bilibili cookies."
           else
