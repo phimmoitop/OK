@@ -66,15 +66,16 @@ jobs:
         run: |
           set -eux
           python -m pip install --upgrade pip
-          python -m pip install --upgrade \
-            rapidocr_onnxruntime \
+          python -m pip install \
+            rapidocr==3.10.0 \
+            onnxruntime \
             pysubs2 \
             numpy \
             requests
           # Kiểm tra xung đột thư viện: tất cả phải import được cùng nhau
           python3 <<'PY'
           import cv2, pysubs2, numpy, requests
-          from rapidocr_onnxruntime import RapidOCR
+          from rapidocr import RapidOCR
           print("ALL IMPORTS OK")
           PY
 
@@ -392,8 +393,8 @@ jobs:
           SAMPLES_PER_WIN = 8      # tang mau tim vi tri sub; early-stop van giu thoi gian nhanh
           MIN_WIN_FRAMES = 1       # chap nhan sub ngan chi xuat hien tren 1 frame mau
           EARLY_STOP_HITS = 3      # du N frame co chu thi bo qua mau con lai cua cua so
-          MAX_REUSE = 2            # can bang toc do va bat kip nhanh khi dong sub thay doi
-          SAME_IOU = 0.85          # nguong giong nhau cua mat na chu sang
+          MAX_REUSE = 2            # chi dung trong worker det+rec du phong
+          SAME_IOU = 0.85          # chi dung trong worker det+rec du phong
           FAST_HALF_K = 0.8        # nua chieu cao dai FAST = th * K
           FAST_STRIP_MAX_RATIO = 0.22   # dai FAST cao hon ty le nay cua video -> tat FAST
           FAST_MIN_SCORE = 0.60    # FAST: diem toi thieu de giu ket qua
@@ -408,8 +409,8 @@ jobs:
           REFINE_MIN_GAP = 1.5     # dung do nhi phan khi khoang < N giay
           REFINE_MAX_IT = 7        # so vong do nhi phan toi da cho moi diem doi
           SEG_PAD = 1.0            # moi doan OCR rong them +-N giay quanh ranh gioi
-          MERGE_GAP = 1.0          # gop 2 cue gan nhau (giay) neu chu gan giong
-          MERGE_SIM = 0.50         # nguong giong khi gop cue (chu >= 6 ky tu)
+          MERGE_GAP = 0.4          # chi noi lai cung mot cue sau mot khung OCR trong
+          MERGE_SIM = 0.90         # khong gop hai cau rieng chi vi cung chu de
           def log(msg):
               print(msg, flush=True)
           _ENGINE = None
@@ -418,12 +419,16 @@ jobs:
               global _ENGINE
               if _ENGINE is not None:
                   return _ENGINE
-              from rapidocr_onnxruntime import RapidOCR
-              try:
-                  # moi process chi 1 thread, tranh tranh chap CPU khi chay song song
-                  _ENGINE = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
-              except Exception:
-                  _ENGINE = RapidOCR()
+              from rapidocr import RapidOCR
+              # PP-OCRv6 small giu toc do; rong 2048 de khong ep dong sub dai vao 320px.
+              _ENGINE = RapidOCR(params={
+                  "Rec.engine_type": "onnxruntime",
+                  "Rec.lang_type": "ch",
+                  "Rec.model_type": "small",
+                  "Rec.ocr_version": "PP-OCRv6",
+                  "Rec.rec_img_shape": [3, 48, 2048],
+                  "Rec.rec_batch_num": 1,
+              })
               return _ENGINE
           def has_text_edges(gray):
               h, w = gray.shape
@@ -433,9 +438,23 @@ jobs:
               return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
           def cjk_count(t):
               return sum("\u4e00" <= ch <= "\u9fff" for ch in t)
+          def output_items(output):
+              """Normalize RapidOCR 3.x output and the older tuple/list output."""
+              if output is None:
+                  return []
+              if isinstance(output, tuple) and len(output) == 2:
+                  output = output[0]
+              if hasattr(output, "boxes") and hasattr(output, "txts"):
+                  boxes = output.boxes
+                  texts = output.txts
+                  scores = getattr(output, "scores", None)
+                  if scores is None:
+                      scores = [1.0] * len(texts)
+                  return list(zip(boxes, texts, scores))
+              return list(output)
           def run_ocr(engine, crop, x_off, y_off, frame_no):
               dets = []
-              result, _ = engine(crop)
+              result = output_items(engine(crop))
               if not result:
                   return dets
               for box, text, score in result:
@@ -456,12 +475,31 @@ jobs:
           def rec_only(engine, img):
               """Chi chay nhan dang (bo phat hien chu): nhanh hon rat nhieu, dung cho 1 dong sub."""
               try:
-                  r, _ = engine(img, use_det=False, use_cls=False, use_rec=True)
+                  r = engine(img, use_det=False, use_cls=False, use_rec=True)
               except Exception:
                   return "", 0.0
               if not r:
                   return "", 0.0
-              return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
+              if isinstance(r, tuple) and len(r) == 2:
+                  r = r[0]
+              if hasattr(r, "txts"):
+                  texts = list(r.txts)
+                  raw_scores = getattr(r, "scores", None)
+                  scores = list(raw_scores) if raw_scores is not None else []
+                  if not texts:
+                      return "", 0.0
+                  return re.sub(r"\s+", "", str(texts[0])), float(scores[0] if scores else 0.0)
+              if isinstance(r, (list, tuple)) and r:
+                  return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
+              return "", 0.0
+          def text_similarity(a, b):
+              a, b = norm_text(a), norm_text(b)
+              return SequenceMatcher(None, a, b, autojunk=False).ratio() if a and b else 0.0
+          def retry_view(img):
+              """Alternative contrast view for first/uncertain frames of a subtitle cue."""
+              gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+              clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+              return cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR)
           def grab_frame(t, width, height):
               """Lay 1 frame tai thoi diem t bang ffmpeg CLI (seek on dinh, khong dung cv2 seek)."""
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}",
@@ -878,7 +916,7 @@ jobs:
               log(f"[worker seg{seg}@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
               return dets
           def worker_fast(task):
-              """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu."""
+              """FAST rec-only; OCR tung frame, them mot view OCR khi dau cue/score thap."""
               seg, start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
@@ -890,8 +928,8 @@ jobs:
                      "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
-              dets, audit, k, calls = [], [], 0, 0
-              last, last_mask, reuse = None, None, 0
+              dets, audit, k, calls, retries = [], [], 0, 0, 0
+              last_text = ""
               t_w = time.time()
               while True:
                   buf = proc.stdout.read(size)
@@ -905,49 +943,45 @@ jobs:
                   frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
-                      audit.append((seg, fn, "", "", "no_text_edges"))
-                      last, last_mask, reuse = None, None, 0
+                      audit.append((seg, fn, "", "", "", "", "", "", "no_text_edges"))
+                      last_text = ""
                       continue
-                  small = cv2.resize(gray, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
-                  mask = small >= 200
-                  cnt = int(mask.sum())
-                  usable = 20 <= cnt <= mask.size * 0.3
-                  if usable and last is not None and last_mask is not None and reuse < MAX_REUSE:
-                      union = int(np.logical_or(mask, last_mask).sum())
-                      inter = int(np.logical_and(mask, last_mask).sum())
-                      if union and inter / union >= SAME_IOU:
-                          reuse += 1
-                          reused = dict(last, frame=fn, time=fn * STEP)
-                          dets.append(reused)
-                          audit.append((seg, fn, reused["text"], f"{reused['score']:.3f}", "reused_previous"))
-                          continue
                   text, score = rec_only(engine, frame)
                   calls += 1
+                  alt_text, alt_score = "", 0.0
+                  # Chay view thu hai chi luc bat dau/doi cau hoac OCR co diem thap.
+                  if score < .72 or (text and (not last_text or text_similarity(text, last_text) < .90)):
+                      alt_text, alt_score = rec_only(engine, retry_view(frame))
+                      retries += 1
+                  selected_text, selected_score = text, score
+                  if alt_text and (alt_score > score + .02 or not text):
+                      selected_text, selected_score = alt_text, alt_score
                   cur = None
-                  chars = cjk_count(text)
-                  min_score = 0.60 if chars <= 2 else FAST_MIN_SCORE
-                  if not text:
+                  chars = cjk_count(selected_text)
+                  if not selected_text:
                       status = "empty_recognition"
                   elif chars < 1:
                       status = "no_chinese_character"
-                  elif score < min_score:
+                  elif selected_score < FAST_MIN_SCORE:
                       status = "rejected_low_confidence"
                   else:
                       status = "accepted"
-                  audit.append((seg, fn, text, f"{score:.3f}", status))
-                  if chars >= 1 and score >= min_score:
-                      glyph_w = sum(th if "\u4e00" <= ch <= "\u9fff" else th * 0.55 for ch in text)
+                  audit.append((seg, fn, text, f"{score:.3f}", alt_text, f"{alt_score:.3f}" if alt_text else "",
+                                selected_text, f"{selected_score:.3f}", status))
+                  # Giu moi ket qua co chu Hoa; diem thap se duoc danh dau de review, khong xoa khoi SRT.
+                  if chars >= 1:
+                      glyph_w = sum(th if "\u4e00" <= ch <= "\u9fff" else th * 0.55 for ch in selected_text)
                       box_w = min(float(x1 - x0), max(th, glyph_w * 1.05))
                       cx = (x0 + x1) / 2.0
                       bx1, bx2 = max(float(x0), cx - box_w / 2.0), min(float(x1), cx + box_w / 2.0)
-                      cur = {"frame": fn, "time": fn * STEP, "text": text, "score": score,
+                      cur = {"frame": fn, "time": fn * STEP, "text": selected_text, "score": selected_score,
                              "x1": bx1, "x2": bx2,
                              "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy, "seg": seg}
                       dets.append(cur)
-                  last, last_mask, reuse = cur, mask, 0
+                  last_text = selected_text
               proc.stdout.close()
               proc.wait()
-              log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
+              log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} retries={retries} in {time.time() - t_w:.0f}s")
               return dets, audit
           def stamp(seconds):
               ms = max(0, round(seconds * 1000))
@@ -963,18 +997,26 @@ jobs:
           def comparable(a, b):
               """Gop frame lien tiep (dung trong cung 1 cue)."""
               a, b = norm_text(a), norm_text(b)
-              return bool(a and b and (a in b or b in a or SequenceMatcher(None, a, b).ratio() >= .68))
+              if not a or not b:
+                  return False
+              if a == b:
+                  return True
+              if min(len(a), len(b)) >= 8 and (a in b or b in a):
+                  return True
+              return (abs(len(a) - len(b)) <= max(1, int(max(len(a), len(b)) * .04))
+                      and SequenceMatcher(None, a, b, autojunk=False).ratio() >= .90)
           def similar_cues(a, b):
-              """Gop cue gan nhau: chu doc nhieu (nhieu loan) cua cung 1 cau."""
+              """Chi noi cue cung noi dung gan nhu trung khit; khong gop cau ke nhau."""
               a, b = norm_text(a), norm_text(b)
               if not a or not b:
                   return False
-              if min(len(a), len(b)) >= 3 and (a in b or b in a):
+              if a == b:
                   return True
-              need = MERGE_SIM if min(len(a), len(b)) >= 6 else 0.75
-              return SequenceMatcher(None, a, b).ratio() >= need
+              return (abs(len(a) - len(b)) <= 1
+                      and SequenceMatcher(None, a, b, autojunk=False).ratio() >= MERGE_SIM)
           def best_variant(variants):
-              return max(variants, key=lambda k: (variants[k], len(k)))
+              # Score cao nhat thay vi tong score; lap lai mot cach doc sai khong duoc tu dong thang.
+              return max(variants, key=lambda k: (variants[k], len(norm_text(k))))
           def merge_cues(cues):
               merged = []
               for c in cues:
@@ -985,7 +1027,7 @@ jobs:
                           m["frames"] += c["frames"]
                           m["scores"].extend(c["scores"])
                           for k, v in c["variants"].items():
-                              m["variants"][k] = m["variants"].get(k, 0.0) + v
+                              m["variants"][k] = max(m["variants"].get(k, 0.0), v)
                           m["text"] = best_variant(m["variants"])
                           continue
                   merged.append(c)
@@ -1003,8 +1045,8 @@ jobs:
               if width <= 0 or height <= 0:
                   raise SystemExit("Cannot read source video dimensions")
               step = STEP
-              # Vung tim kiem: giua 65% ngang, 35% duoi (tranh chu AI o goc phai duoi)
-              x0, x1 = round(width * .175), round(width * .825)
+              # Dai ngang rong de khong cat mat chu dau/cuoi cua dong phu de dai.
+              x0, x1 = round(width * .05), round(width * .95)
               y0 = round(height * .65)
               ctx = (width, height, x0, x1, y0)
               nw = max(1, min(4, os.cpu_count() or 2))
@@ -1134,9 +1176,10 @@ jobs:
                   detections = [d for part, _ in parts for d in part]
                   frame_audit = sorted((row for _, rows in parts for row in rows), key=lambda row: (row[1], row[0]))
                   with (OUT / "ocr-frames-5fps.txt").open("w", encoding="utf-8") as f:
-                      f.write("segment\tframe\ttime\tconfidence\traw_text\tstatus\n")
-                      for si, fn, text, score, status in frame_audit:
-                          f.write(f"{si}\t{fn}\t{fn * STEP:.3f}\t{score}\t{text}\t{status}\n")
+                      f.write("segment\tframe\ttime\traw_text\traw_confidence\talt_text\talt_confidence\tselected_text\tselected_confidence\tstatus\n")
+                      for si, fn, raw, raw_score, alt, alt_score, selected, selected_score, status in frame_audit:
+                          f.write(f"{si}\t{fn}\t{fn * STEP:.3f}\t{raw}\t{raw_score}\t{alt}\t{alt_score}\t"
+                                  f"{selected}\t{selected_score}\t{status}\n")
               else:
                   detections = [d for p in parts for d in p]
               detections.sort(key=lambda d: (d["frame"], d["seg"], d["x1"]))
@@ -1173,7 +1216,7 @@ jobs:
                       c["last"] = t
                       c["frames"] += 1
                       c["scores"].append(score)
-                      c["variants"][text] = c["variants"].get(text, 0.0) + score
+                      c["variants"][text] = max(c["variants"].get(text, 0.0), score)
                       c["text"] = best_variant(c["variants"])
                   else:
                       cues.append({"text": text, "first": t, "last": t, "frames": 1,
@@ -1182,17 +1225,8 @@ jobs:
               cues = merge_cues(cues)
               n_merged = len(cues)
               def keep_cue(x):
-                  chars = cjk_count(x["text"])
-                  if chars < 1:
-                      return False
-                  mean = sum(x["scores"]) / len(x["scores"])
-                  if x["frames"] >= 2:
-                      return True
-                  if chars <= 2:
-                      # Ưu tiên giữ cue ngắn để bước dịch khôi phục theo ngữ cảnh;
-                      # cue ít frame/độ tin cậy thấp vẫn được lưu để rà soát.
-                      return max(x["scores"]) >= .30 and mean >= .30
-                  return max(x["scores"]) >= .65 and mean >= .75
+                  # Chinh sach uu tien do day: giu cue OCR co chu Trung, ke ca cue 1 frame/diem thap.
+                  return cjk_count(x["text"]) >= 1
               cues = [x for x in cues if keep_cue(x)]
               log(f"[CUE] {n_before} cue tho -> {n_merged} sau gop cue gan nhau -> {len(cues)} sau loc rac")
               srt = OUT / "hardsub-5fps.srt"
@@ -1534,6 +1568,8 @@ jobs:
           mkdir -p "$PACK"
           cp "${EP_DIR}/native.srt" "$PACK/native.srt"
           cp "${EP_DIR}/native-frames-5fps.txt" "$PACK/native-frames-5fps.txt"
+          cp "${EP_DIR}/ocr/ocr-raw-5fps.tsv" "$PACK/ocr-raw-5fps.tsv"
+          cp "${EP_DIR}/ocr/ocr-review-needed.tsv" "$PACK/ocr-review-needed.tsv"
           cp "${EP_DIR}/subtitle_geometry.json" "$PACK/subtitle_geometry.json"
           cp "${EP_DIR}/static_regions.json" "$PACK/static_regions.json"
           printf '%s' "$PD_ID" > "$PACK/raw.txt"
