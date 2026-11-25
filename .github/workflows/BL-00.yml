@@ -1,4 +1,4 @@
-name: "TEST [00/04] AUDIO ASR ONLY + OCR GEOMETRY"
+name: "TEST [00/04] BILIBILI SUB → ASR FALLBACK"
 
 on:
   workflow_dispatch:
@@ -10,6 +10,10 @@ on:
       slug:
         description: "slug video"
         required: true
+        type: string
+      bili:
+        description: "Bili"
+        required: false
         type: string
 
 permissions:
@@ -34,14 +38,38 @@ jobs:
       - name: Validate inputs
         env:
           PD_LINK: ${{ inputs.link }}
+          BILI_INPUT: ${{ inputs.bili }}
         run: |
           set -euo pipefail
           PD_LINK="$(echo -n "$PD_LINK" | tr -d '[:space:]')"
           [[ "$PD_LINK" =~ ^([A-Za-z0-9_-]+)-RAW$ ]] || { echo '::error::link phải có dạng Pixeldrain RAW ID, ví dụ cG27aCed-RAW'; exit 1; }
           PD_ID="${BASH_REMATCH[1]}"
+          export PD_ID
           [[ "$SLUG" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || { echo '::error::slug chỉ được chứa A-Z a-z 0-9 _ -'; exit 1; }
+          export BILI_INPUT="$(echo -n "${BILI_INPUT:-}" | tr -d '[:space:]')"
           echo "PD_ID=$PD_ID" >> "$GITHUB_ENV"
-          echo "RAW Pixeldrain ID=$PD_ID"
+          python3 - <<'PYURL'
+          import os, re
+          from urllib.parse import urlparse, parse_qs
+          raw=os.environ.get("BILI_INPUT", "")
+          if not raw:
+              bvid, page = "", "1"
+          else:
+              u=urlparse(raw)
+              if u.scheme != "https" or u.hostname not in ("bilibili.com", "www.bilibili.com"):
+                  raise SystemExit("::error::bili phải là link https://www.bilibili.com/video/BV...")
+              m=re.fullmatch(r"/video/(BV[0-9A-Za-z]{10})/?", u.path)
+              if not m or u.username or u.password or u.fragment:
+                  raise SystemExit("::error::Link bili không đúng dạng video Bilibili")
+              q=parse_qs(u.query, keep_blank_values=True)
+              page=(q.get("p") or ["1"])[0]
+              if not re.fullmatch(r"[1-9][0-9]{0,3}", page):
+                  raise SystemExit("::error::Tham số p trong link bili phải là số từ 1 đến 9999")
+              bvid=m.group(1)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"BILIBILI_BVID={bvid}\nBILIBILI_PAGE={page}\n")
+          print(f"RAW Pixeldrain ID={os.environ.get('PD_ID','')} | Bilibili subtitle lookup: {bvid or 'disabled'} page={page}")
+          PYURL
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -100,6 +128,20 @@ jobs:
         run: |
           set -eux
           mkdir -p work work/eps
+
+      - name: Prepare optional Bilibili cookies
+        env:
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BILIBILI_COOKIES:-}" ]; then
+            printf '%s' "$BILIBILI_COOKIES" > work/bilibili-cookie-input.txt
+            python3 tools/prepare_cookies.py work/bilibili-cookie-input.txt work/bilibili-cookies.txt
+            rm -f work/bilibili-cookie-input.txt
+            echo "Prepared optional Bilibili cookies."
+          else
+            echo "No BILIBILI_COOKIES secret; trying public subtitle metadata."
+          fi
 
       # ============================================================
       # TẢI RAW VIDEO ĐÃ CÓ TRÊN PIXELDRAIN
@@ -1521,7 +1563,193 @@ jobs:
           print(f"[ASR] language={info.language} probability={info.language_probability:.3f} cues={len(subs.events)}", flush=True)
           PY
 
-      - name: Process episode (OCR geometry/static + audio-only subtitles)
+      - name: Create Bilibili subtitle fetcher
+        run: |
+          cat > bilibili_subtitles.py <<'PY'
+          import http.cookiejar, json, os, re, subprocess, sys
+          from pathlib import Path
+          from difflib import SequenceMatcher
+          import requests
+          import pysubs2
+
+          work = Path(os.environ["WORK_DIR"])
+          bvid = os.environ.get("BILIBILI_BVID", "").strip()
+          page = int(os.environ.get("BILIBILI_PAGE", "1"))
+          out_srt = work / "bilibili-sub-zh.srt"
+          if not bvid:
+              print("[BILI-SUB] No BVID supplied; use audio ASR fallback.", flush=True)
+              raise SystemExit(2)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+              "Referer": f"https://www.bilibili.com/video/{bvid}/?p={page}",
+              "Origin": "https://www.bilibili.com",
+          })
+          cookie_file = os.environ.get("BILI_COOKIE_FILE", "")
+          if cookie_file and Path(cookie_file).is_file():
+              jar = http.cookiejar.MozillaCookieJar(cookie_file)
+              try:
+                  jar.load(ignore_discard=True, ignore_expires=True)
+                  session.cookies.update(jar)
+                  print("[BILI-SUB] Optional login cookies loaded.", flush=True)
+              except Exception as exc:
+                  print(f"[BILI-SUB] Cookie file ignored: {exc}", flush=True)
+
+          def get_json(url, params):
+              response = session.get(url, params=params, timeout=20, allow_redirects=False)
+              response.raise_for_status()
+              data = response.json()
+              if not isinstance(data, dict):
+                  raise ValueError("Unexpected Bilibili API response")
+              return data
+
+          try:
+              pages_resp = get_json("https://api.bilibili.com/x/player/pagelist", {"bvid": bvid})
+              page_list = pages_resp.get("data")
+              if pages_resp.get("code") != 0 or not isinstance(page_list, list):
+                  raise ValueError(f"Could not get Bilibili page list (code={pages_resp.get('code')})")
+              selected = next((item for item in page_list if int(item.get("page", 0)) == page), None)
+              if not selected or not selected.get("cid"):
+                  raise ValueError(f"Bilibili page {page} was not found")
+              cid = str(selected["cid"])
+              bili_duration = float(selected.get("duration") or 0)
+              raw_duration = float(subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                  "-of", "default=nw=1:nk=1", os.environ["VIDEO"]], text=True).strip())
+              if bili_duration > 0 and abs(bili_duration - raw_duration) > max(2.0, raw_duration * 0.01):
+                  raise ValueError(f"Bilibili page duration {bili_duration:.2f}s does not match RAW {raw_duration:.2f}s")
+              print(f"[BILI-SUB] Resolved {bvid} page={page} cid={cid} | Bilibili duration={bili_duration:.2f}s RAW={raw_duration:.2f}s", flush=True)
+
+              player = get_json("https://api.bilibili.com/x/player/v2", {"bvid": bvid, "cid": cid})
+              payload = player.get("data") or {}
+              tracks = ((payload.get("subtitle") or {}).get("subtitles") or [])
+              if not tracks:
+                  raise ValueError("No subtitle tracks returned (may require a Bilibili login)")
+              preference = {"ai-zh": 0, "zh-CN": 1, "zh-Hans": 2, "zh-Hant": 3, "zh": 4}
+              tracks = [t for t in tracks if isinstance(t, dict) and t.get("subtitle_url") and
+                        (str(t.get("lan", "")).lower().startswith("zh") or str(t.get("lan", "")).lower() == "ai-zh")]
+              tracks.sort(key=lambda t: preference.get(str(t.get("lan", "")).lower(), 10))
+              if not tracks:
+                  raise ValueError("No Chinese subtitle track available")
+
+              duration = raw_duration
+              failures = []
+              for track in tracks:
+                  url = str(track["subtitle_url"])
+                  if url.startswith("//"):
+                      url = "https:" + url
+                  elif url.startswith("/"):
+                      url = "https://api.bilibili.com" + url
+                  try:
+                      response = session.get(url, timeout=30, allow_redirects=False)
+                      response.raise_for_status()
+                      doc = response.json()
+                      body = doc.get("body") if isinstance(doc, dict) else None
+                      if not isinstance(body, list):
+                          raise ValueError("Subtitle JSON has no body list")
+                      events = []
+                      cjk = 0
+                      for row in body:
+                          text = re.sub(r"\s+", " ", str(row.get("content", ""))).strip()
+                          try:
+                              start, end = float(row["from"]), float(row["to"])
+                          except (KeyError, TypeError, ValueError):
+                              continue
+                          if not text or start < 0 or end <= start or start > duration + 2:
+                              continue
+                          end = min(end, duration)
+                          if end <= start:
+                              continue
+                          cjk += sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+                          events.append(pysubs2.SSAEvent(start=int(start * 1000), end=max(int(start * 1000) + 50, int(end * 1000)), text=text))
+                      if len(events) < 3 or cjk < 10:
+                          raise ValueError(f"Track too sparse/unusable: cues={len(events)} CJK={cjk}")
+                      original_srt = work / "bilibili-sub-zh-original.srt"
+                      original = pysubs2.SSAFile()
+                      original.events = [pysubs2.SSAEvent(start=e.start, end=e.end, text=e.text) for e in events]
+                      original.save(str(original_srt), encoding="utf-8")
+
+                      # Reuse the OCR SRT already produced for this video to estimate
+                      # whether Bilibili's cue clock is consistently early/late.
+                      import bisect, statistics
+                      ocr_srt = work / "ocr" / "hardsub-5fps.srt"
+                      matched, applied_offset, mad, center = 0, 0.0, None, 0.0
+                      if ocr_srt.is_file() and events:
+                          ocr_subs = pysubs2.load(str(ocr_srt), encoding="utf-8")
+                          ocr_events = sorted((e for e in ocr_subs.events if e.text.strip()), key=lambda e: e.start)
+                          ocr_starts = [e.start for e in ocr_events]
+                          used = set()
+                          offsets = []
+                          def norm(t):
+                              return re.sub(r"[^\u2e80-\u9fff]", "", (t or "").casefold())
+                          for bili_event in events:
+                              bk = norm(bili_event.text)
+                              if len(bk) < 4:
+                                  continue
+                              lo = bisect.bisect_left(ocr_starts, bili_event.start - 3000)
+                              hi = bisect.bisect_right(ocr_starts, bili_event.start + 3000)
+                              best = None
+                              for j in range(lo, hi):
+                                  if j in used:
+                                      continue
+                                  ok = norm(ocr_events[j].text)
+                                  if len(ok) < 4:
+                                      continue
+                                  ratio = SequenceMatcher(None, bk, ok).ratio()
+                                  if bk in ok or ok in bk:
+                                      ratio = max(ratio, min(len(bk), len(ok)) / float(max(len(bk), len(ok))))
+                                  proximity = abs(ocr_events[j].start - bili_event.start)
+                                  rank = (ratio, -proximity)
+                                  if best is None or rank > best[0]:
+                                      best = (rank, j)
+                              if best and best[0][0] >= 0.58:
+                                  j = best[1]
+                                  used.add(j)
+                                  offsets.append((ocr_events[j].start - bili_event.start) / 1000.0)
+                          matched = len(offsets)
+                          if offsets:
+                              center = statistics.median(offsets)
+                              mad = statistics.median(abs(x - center) for x in offsets)
+                              if matched >= 5 and abs(center) <= 2.0 and mad <= 0.45:
+                                  applied_offset = round(center, 3)
+                                  shift_ms = int(round(applied_offset * 1000))
+                                  duration_ms = int(duration * 1000)
+                                  for event in events:
+                                      start = event.start + shift_ms
+                                      end = event.end + shift_ms
+                                      if start >= duration_ms:
+                                          start = max(0, duration_ms - 50)
+                                          end = duration_ms
+                                      else:
+                                          start = max(0, start)
+                                          end = min(duration_ms, max(start + 50, end))
+                                      event.start, event.end = start, end
+                      calibrated = pysubs2.SSAFile()
+                      calibrated.events = events
+                      calibrated.save(str(out_srt), encoding="utf-8")
+                      info = {"bvid": bvid, "page": page, "cid": cid,
+                              "language": track.get("lan"), "language_label": track.get("lan_doc"),
+                              "cue_count": len(events), "video_duration": duration,
+                              "source": "Bilibili subtitle track",
+                              "ocr_timing_check": {"matched_cues": matched, "median_ocr_minus_bilibili_seconds": round(float(center), 3),
+                                                    "mad_seconds": round(float(mad), 3) if mad is not None else None,
+                                                    "applied_shift_seconds": applied_offset,
+                                                    "shift_applied": bool(applied_offset)}}
+                      (work / "bilibili-subtitle-info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                      print(f"[BILI-SUB] Selected {info['language']} ({info['language_label']}); {len(events)} cues; OCR time matches={matched}, median offset={info['ocr_timing_check']['median_ocr_minus_bilibili_seconds']:+.3f}s, applied={applied_offset:+.3f}s", flush=True)
+                      raise SystemExit(0)
+                  except SystemExit:
+                      raise
+                  except Exception as exc:
+                      failures.append(f"{track.get('lan')}: {exc}")
+              raise ValueError("No usable Chinese Bilibili track. " + "; ".join(failures))
+          except Exception as exc:
+              print(f"[BILI-SUB] unavailable: {exc}; use audio ASR fallback.", flush=True)
+              raise SystemExit(2)
+          PY
+
+      - name: Process episode (Bilibili subtitles with ASR fallback + OCR geometry/static)
         env:
           PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
           OMP_NUM_THREADS: "1"
@@ -1533,22 +1761,37 @@ jobs:
           export VIDEO="${EP_DIR}/raw_video.mp4"
           export WORK_DIR="${EP_DIR}"
           mkdir -p "${EP_DIR}/ocr"
+          export BILI_COOKIE_FILE="${GITHUB_WORKSPACE}/work/bilibili-cookies.txt"
           python3 ocr_run.py
-          python3 audio_asr.py
-          cp "${EP_DIR}/audio-asr-zh.srt" "${EP_DIR}/native.srt"
+          if python3 bilibili_subtitles.py; then
+            cp "${EP_DIR}/bilibili-sub-zh.srt" "${EP_DIR}/native.srt"
+            SUBTITLE_SOURCE="bilibili"
+            echo "[SUBTITLE] Using Bilibili subtitle track; ASR skipped."
+          else
+            echo "[SUBTITLE] Bilibili subtitle unavailable; falling back to Whisper ASR."
+            python3 audio_asr.py
+            cp "${EP_DIR}/audio-asr-zh.srt" "${EP_DIR}/native.srt"
+            SUBTITLE_SOURCE="audio-asr"
+          fi
+          printf '%s\n' "$SUBTITLE_SOURCE" > "${EP_DIR}/subtitle_source.txt"
           python3 - <<'PYCODE'
           import json, os, sys
           d=os.environ['WORK_DIR']
           g=json.load(open(os.path.join(d,'subtitle_geometry.json'),encoding='utf-8'))
           if not g.get('valid') or not g.get('segments'):
               sys.exit('::error::Không xác định được vị trí phụ đề để làm mờ.')
-          print(f"Audio-only subtitle cues: {sum(1 for _ in open(os.path.join(d,'native.srt'),encoding='utf-8') if '-->' in _)} | geometry segments: {len(g['segments'])}")
+          n=sum(1 for _ in open(os.path.join(d,'native.srt'),encoding='utf-8') if '-->' in _)
+          print(f"Subtitle source: {open(os.path.join(d,'subtitle_source.txt'),encoding='utf-8').read().strip()} | cues: {n} | geometry segments: {len(g['segments'])}")
           PYCODE
           python3 static_detect.py
           PACK="${EP_DIR}/pack"
           mkdir -p "$PACK"
           cp "${EP_DIR}/native.srt" "$PACK/native.srt"
-          cp "${EP_DIR}/audio-asr-zh.srt" "$PACK/audio-asr-zh.srt"
+          cp "${EP_DIR}/subtitle_source.txt" "$PACK/subtitle_source.txt"
+          [ ! -s "${EP_DIR}/audio-asr-zh.srt" ] || cp "${EP_DIR}/audio-asr-zh.srt" "$PACK/audio-asr-zh.srt"
+          [ ! -s "${EP_DIR}/bilibili-sub-zh.srt" ] || cp "${EP_DIR}/bilibili-sub-zh.srt" "$PACK/bilibili-sub-zh.srt"
+          [ ! -s "${EP_DIR}/bilibili-sub-zh-original.srt" ] || cp "${EP_DIR}/bilibili-sub-zh-original.srt" "$PACK/bilibili-sub-zh-original.srt"
+          [ ! -s "${EP_DIR}/bilibili-subtitle-info.json" ] || cp "${EP_DIR}/bilibili-subtitle-info.json" "$PACK/bilibili-subtitle-info.json"
           cp "${EP_DIR}/subtitle_geometry.json" "$PACK/subtitle_geometry.json"
           cp "${EP_DIR}/static_regions.json" "$PACK/static_regions.json"
           printf '%s' "$PD_ID" > "$PACK/raw.txt"
@@ -1559,4 +1802,4 @@ jobs:
           curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -G "https://cp.ssplay.net/bili.php" \
             --data-urlencode "type=ocr" --data-urlencode "slug=${SLUG}" --data-urlencode "pixel=${PIXEL_ID}"
           echo
-          echo "Audio ASR Pixel ID=$PIXEL_ID | input for step1: ${PD_ID}-SUBCN-${PIXEL_ID}"
+          echo "Bilibili/ASR Pixel ID=$PIXEL_ID | input for step1: ${PD_ID}-SUBCN-${PIXEL_ID}"
