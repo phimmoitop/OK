@@ -1157,125 +1157,25 @@ jobs:
                   log(f"[SEGMENT {i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']:.0f} "
                       f"({s['cy_lo']:.0f}..{s['cy_hi']:.0f}) th={s['height']:.0f} | "
                       f"fast_strip y={s['ty0']}..{s['ty1']} ({s['ty1'] - s['ty0']}px)")
-              # ---------- 1d: tu kiem tra FAST (1 lan, tren doan chinh) ----------
-              # Chi dung FAST rec-only cho OCR toan video. Det+rec van duoc dung o buoc neo vi tri.
-              # Neu dai crop khong hop le thi dung workflow thay vi am tham chay cham bang det+rec.
-              if not strips_ok:
-                  raise RuntimeError("FAST OCR không thể chạy: dải phụ đề quá cao/thấp hoặc crop không hợp lệ.")
-              fast = True
-              log("[FAST-CHECK] Bật FAST rec-only; không fallback sang det+rec.")
-              log(f"[ANCHOR] giai doan 1 xong sau {time.time() - t_start:.0f}s")
-              # ---------- GIAI DOAN 2: OCR toan video theo doan ----------
-              total_frames = int(duration * FPS)
-              ranges = []
-              for si, s in enumerate(segs):
-                  fa = 0 if si == 0 else int(max(0.0, s["t_start"] - SEG_PAD) * FPS)
-                  fb = total_frames if si == len(segs) - 1 else min(total_frames, int(math.ceil((s["t_end"] + SEG_PAD) * FPS)))
-                  if fb > fa:
-                      ranges.append((si, fa, fb))
-              tot = sum(fb - fa for _, fa, fb in ranges)
-              chunk = max(60, int(math.ceil(tot / float(nw * 4))))
-              tasks = []
-              for si, fa, fb in ranges:
-                  s = segs[si]
-                  for sf in range(fa, fb, chunk):
-                      n = min(chunk, fb - sf)
-                      if fast:
-                          tasks.append((si, sf, n, x0, s["ty0"], x1, s["ty1"], s["center_y"], s["height"]))
-                      else:
-                          tasks.append((si, sf, n, x0, s["sy0"], x1, s["sy1"]))
-              log(f"[OCR] mode={'FAST rec-only' if fast else 'det+rec'} | {total_frames} frame, "
-                  f"{len(tasks)} task, {len(segs)} doan, cpu_count={os.cpu_count()}")
-              with mp_ctx.Pool(max(1, min(nw, len(tasks)))) as pool:
-                  parts = list(pool.imap_unordered(worker_fast if fast else worker, tasks, chunksize=1))
-              detections = [d for p in parts for d in p]
-              detections.sort(key=lambda d: (d["frame"], d["seg"], d["x1"]))
-              log(f"[OCR] xong sau {time.time() - t_start:.0f}s, detections={len(detections)}")
+              # ---------- OCR geometry-only: không OCR dày toàn video để tạo subtitle ----------
+              # Detections ở đây chỉ là các frame mẫu dùng tìm vị trí sub/logo và làm preview.
+              detections = dets_all
               with (OUT / "ocr-raw-5fps.tsv").open("w", encoding="utf-8") as f:
                   f.write("time\tconfidence\ttext\tx1\ty1\tx2\ty2\tseg\n")
                   for d in detections:
                       f.write(f"{d['time']:.3f}\t{d['score']:.3f}\t{d['text']}\t"
-                              f"{d['x1']:.1f}\t{d['y1']:.1f}\t{d['x2']:.1f}\t{d['y2']:.1f}\t{d['seg']}\n")
-              if not fast:
-                  detections = apply_static(detections, static_info)
-              # Chi giu box nam trong dai y cua chinh doan do (loai chu canh/scene text)
-              filtered = []
-              for d in detections:
-                  s = segs[d["seg"]]
-                  m = max(12.0, 1.0 * s["height"])
-                  if s["cy_lo"] - m <= d["cy"] <= s["cy_hi"] + m:
-                      filtered.append(d)
-              by_frame = {}
-              for d in filtered:
-                  by_frame.setdefault(d["frame"], {}).setdefault(d["seg"], []).append(d)
-              frame_lines = []
-              for fn, bysg in sorted(by_frame.items()):
-                  best = max(bysg.values(), key=lambda it: sum(x["score"] * len(x["text"]) for x in it))
-                  best = sorted(best, key=lambda d: (d["y1"], d["x1"]))
-                  line = "".join(d["text"] for d in best)
-                  if line:
-                      frame_lines.append((fn * step, line, max(d["score"] for d in best), fn))
-              # ---------- Gom frame lien tiep -> cue ----------
-              cues = []
-              for t, text, score, fn in frame_lines:
-                  if cues and t - cues[-1]["last"] <= step * 1.51 and comparable(cues[-1]["text"], text):
-                      c = cues[-1]
-                      c["last"] = t
-                      c["frames"] += 1
-                      c["scores"].append(score)
-                      c["variants"][text] = c["variants"].get(text, 0.0) + score
-                      c["text"] = best_variant(c["variants"])
-                  else:
-                      cues.append({"text": text, "first": t, "last": t, "frames": 1,
-                                   "scores": [score], "variants": {text: score}})
-              n_before = len(cues)
-              cues = merge_cues(cues)
-              n_merged = len(cues)
-              def keep_cue(x):
-                  chars = cjk_count(x["text"])
-                  if chars < 1:
-                      return False
-                  mean = sum(x["scores"]) / len(x["scores"])
-                  if x["frames"] >= 2:
-                      return True
-                  if chars <= 2:
-                      # Ưu tiên giữ cue ngắn để bước dịch khôi phục theo ngữ cảnh;
-                      # cue ít frame/độ tin cậy thấp vẫn được lưu để rà soát.
-                      return max(x["scores"]) >= .30 and mean >= .30
-                  return max(x["scores"]) >= .65 and mean >= .75
-              cues = [x for x in cues if keep_cue(x)]
-              log(f"[CUE] {n_before} cue tho -> {n_merged} sau gop cue gan nhau -> {len(cues)} sau loc rac")
-              srt = OUT / "hardsub-5fps.srt"
-              with srt.open("w", encoding="utf-8") as f:
-                  prev_end = 0.0
-                  idx = 0
-                  for seg in cues:
-                      start = max(prev_end, max(0, seg["first"] - step / 2))
-                      end = min(duration, seg["last"] + step / 2)
-                      if end > start:
-                          idx += 1
-                          f.write(f"{idx}\n{stamp(start)} --> {stamp(end)}\n{seg['text']}\n\n")
-                          prev_end = end
-              review_rows = []
-              for seg in cues:
-                  mean = sum(seg["scores"]) / len(seg["scores"])
-                  reasons = []
-                  if mean < .85:
-                      reasons.append("low_confidence")
-                  if seg["frames"] < 2:
-                      reasons.append("single_sample")
-                  if reasons:
-                      review_rows.append((seg, mean, ",".join(reasons)))
-              with (OUT / "ocr-review-needed.tsv").open("w", encoding="utf-8") as f:
-                  f.write("start\tend\tmean_confidence\tframes\ttext\treason\n")
-                  for seg, mean, reason in review_rows:
-                      f.write(f"{seg['first']:.3f}\t{seg['last']:.3f}\t{mean:.3f}\t"
-                              f"{seg['frames']}\t{seg['text']}\t{reason}\n")
+                              f"{d['x1']:.1f}\t{d['y1']:.1f}\t{d['x2']:.1f}\t{d['y2']:.1f}\t{d['win']}\n")
+              # Các artifact OCR cũ được giữ rỗng để tương thích với workflow; native.srt
+              # chỉ lấy từ Bilibili, hoặc ASR nếu Bilibili không có/không truy cập được.
+              (OUT / "hardsub-5fps.srt").write_text("", encoding="utf-8")
+              (OUT / "ocr-review-needed.tsv").write_text(
+                  "start\tend\tmean_confidence\tframes\ttext\treason\n", encoding="utf-8")
+              cues, review_rows = [], []
               # ---------- Geometry (blur bam theo tung doan sub) ----------
               valid_geometry = bool(segs) and len(real) >= max(1, int(math.ceil(0.25 * n_win)))
               geometry["anchors"] = len(real)
               geometry["windows"] = n_win
-              geometry["fast_ocr"] = bool(fast)
+              geometry["ocr_mode"] = "sampled-anchors-only"
               geometry["subtitle_center_y"] = int(round(float(np.median([s["center_y"] for s in segs]))))
               geometry["subtitle_height"] = int(round(float(np.median([s["height"] for s in segs]))))
               blur_segs = build_blur_segments(real, segs, width, height)
@@ -1306,14 +1206,12 @@ jobs:
                       cv2.imwrite(str(WORK / "subtitle-geometry-preview.jpg"), image)
               except Exception as e:
                   log(f"[PREVIEW] bo qua: {e!r}")
-              needs_review = bool(review_rows) or not valid_geometry or not cues
+              needs_review = not valid_geometry
               write_gh_output(needs_review)
               print(f"duration={duration:.3f}s size={width}x{height} "
                     f"windows={n_win} anchors={len(real)} segments={len(segs)} blur_segments={len(blur_segs)} "
-                    f"ocr_detections={len(detections)} subtitle_cues={len(cues)} "
-                    f"review_cues={len(review_rows)} geometry_valid={valid_geometry}")
-              if not cues:
-                  print("OCR produced no stable subtitle cues.")
+                    f"sample_ocr_detections={len(detections)} subtitle_cues=0 "
+                    f"geometry_valid={valid_geometry}")
           if __name__ == "__main__":
               main()
           PY
@@ -1776,6 +1674,22 @@ jobs:
                                           start = max(0, start)
                                           end = min(duration_ms, max(start + 50, end))
                                       event.start, event.end = start, end
+                      # Bilibili AI subtitles tend to appear slightly ahead of the hard subs.
+                      # Add a small fixed delay even when sparse geometry OCR cannot calibrate.
+                      fixed_delay = 0.300
+                      fixed_ms = int(round(fixed_delay * 1000))
+                      duration_ms = int(duration * 1000)
+                      for event in events:
+                          start = event.start + fixed_ms
+                          end = event.end + fixed_ms
+                          if start >= duration_ms:
+                              start = max(0, duration_ms - 50)
+                              end = duration_ms
+                          else:
+                              start = max(0, start)
+                              end = min(duration_ms, max(start + 50, end))
+                          event.start, event.end = start, end
+                      total_applied_offset = round(applied_offset + fixed_delay, 3)
                       calibrated = pysubs2.SSAFile()
                       calibrated.events = events
                       calibrated.save(str(out_srt), encoding="utf-8")
@@ -1785,10 +1699,12 @@ jobs:
                               "source": "Bilibili subtitle track",
                               "ocr_timing_check": {"matched_cues": matched, "median_ocr_minus_bilibili_seconds": round(float(center), 3),
                                                     "mad_seconds": round(float(mad), 3) if mad is not None else None,
-                                                    "applied_shift_seconds": applied_offset,
-                                                    "shift_applied": bool(applied_offset)}}
+                                                    "ocr_applied_shift_seconds": applied_offset,
+                                                    "fixed_delay_seconds": fixed_delay,
+                                                    "applied_shift_seconds": total_applied_offset,
+                                                    "shift_applied": bool(total_applied_offset)}}
                       (work / "bilibili-subtitle-info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                      print(f"[BILI-SUB] Selected {info['language']} ({info['language_label']}); {len(events)} cues; OCR time matches={matched}, median offset={info['ocr_timing_check']['median_ocr_minus_bilibili_seconds']:+.3f}s, applied={applied_offset:+.3f}s", flush=True)
+                      print(f"[BILI-SUB] Selected {info['language']} ({info['language_label']}); {len(events)} cues; OCR time matches={matched}, median offset={info['ocr_timing_check']['median_ocr_minus_bilibili_seconds']:+.3f}s, OCR applied={applied_offset:+.3f}s, fixed delay=+{fixed_delay:.3f}s, total applied=+{total_applied_offset:.3f}s", flush=True)
                       raise SystemExit(0)
                   except SystemExit:
                       raise
