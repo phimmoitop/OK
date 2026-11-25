@@ -457,8 +457,15 @@ jobs:
                   boxes = output.boxes
                   texts = output.txts
                   scores = getattr(output, "scores", None)
+                  if boxes is None or texts is None:
+                      return []
+                  texts = list(texts)
+                  if not texts:
+                      return []
                   if scores is None:
                       scores = [1.0] * len(texts)
+                  else:
+                      scores = list(scores)
                   return list(zip(boxes, texts, scores))
               return list(output)
           def run_ocr(engine, crop, x_off, y_off, frame_no):
@@ -492,7 +499,10 @@ jobs:
               if isinstance(r, tuple) and len(r) == 2:
                   r = r[0]
               if hasattr(r, "txts"):
-                  texts = list(r.txts)
+                  raw_texts = r.txts
+                  if raw_texts is None:
+                      return "", 0.0
+                  texts = list(raw_texts)
                   raw_scores = getattr(r, "scores", None)
                   scores = list(raw_scores) if raw_scores is not None else []
                   if not texts:
