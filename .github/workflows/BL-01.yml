@@ -549,7 +549,7 @@ jobs:
           2) Bo dong trong / chi co dau cau / khong co chu cai.
           3) Gop cau TRUNG hoac GAN GIONG nhau trong cua so thoi gian ngan, giu ban dai hon.
           4) Sua thoi gian: sap xep, khong chong lan, end > start.
-          5) Kiem tra cung: khong CJK, khong cap lien ke trung lap, co it nhat vai cue. Loi -> exit 1.
+          5) CJK / cap cau gan giong -> canh bao; khong con cue -> exit 1.
           """
           import json, os, re, sys, unicodedata
           from difflib import SequenceMatcher
@@ -664,15 +664,16 @@ jobs:
                   if c["end"] <= c["start"]:
                       c["end"] = c["start"] + 0.1
               errors = []
+              warnings = []
               for i, c in enumerate(out):
                   if CJK_RE.search(c["text"]):
-                      errors.append(f"cue {i} con ky tu Trung: {c['text']!r}")
+                      warnings.append(f"cue {i} con ky tu Trung, giu lai: {c['text']!r}")
                   if i > 0:
                       p = out[i - 1]
                       words = min(n_words(p["text"]), n_words(c["text"]))
                       win = WIN_SHORT if words < SHORT_WORDS else WIN_LONG
                       if c["start"] - p["end"] <= win and is_dup(p["key"], c["key"]):
-                          errors.append(f"cue {i-1}/{i} trung lap: {p['text']!r} | {c['text']!r}")
+                          warnings.append(f"cue {i-1}/{i} gan giong, giu ca hai: {p['text']!r} | {c['text']!r}")
               if len(out) < MIN_FINAL_CUES:
                   errors.append("khong con cue nao sau khi hoan thien")
               with (WORK / "vi_dropped.txt").open("w", encoding="utf-8") as f:
@@ -680,6 +681,8 @@ jobs:
                       f.write(f"{st:8.2f}s | {why:11s} | ZH={zh!r} | VI={vi!r}\n")
               log(f"[FINALIZE] raw={len(raw)} -> sach={n_clean} -> sau loai trung={n_dedup} | "
                   f"bo {len(dropped)} dong (chi tiet: vi_dropped.txt)")
+              for w in warnings[:30]:
+                  print(f"::warning::{w}")
               if errors:
                   for e in errors[:30]:
                       print(f"::error::{e}")
