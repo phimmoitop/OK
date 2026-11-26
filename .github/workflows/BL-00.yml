@@ -459,8 +459,11 @@ jobs:
                   return []
               if isinstance(output, tuple) and len(output) == 2:
                   output = output[0]
-              if hasattr(output, "boxes") and hasattr(output, "txts"):
-                  boxes = output.boxes
+              if hasattr(output, "txts"):
+                  # RapidOCR 3.x may return TextRecOutput for recognition-only
+                  # results. Those objects have text/scores but no detected
+                  # boxes, so they cannot be used as positioned detections.
+                  boxes = getattr(output, "boxes", None)
                   texts = output.txts
                   scores = getattr(output, "scores", None)
                   if boxes is None or texts is None:
@@ -473,7 +476,11 @@ jobs:
                   else:
                       scores = list(scores)
                   return list(zip(boxes, texts, scores))
-              return list(output)
+              try:
+                  return list(output)
+              except TypeError:
+                  # Unknown non-iterable RapidOCR output; treat it as no detections.
+                  return []
           def run_ocr(engine, crop, x_off, y_off, frame_no):
               dets = []
               result = output_items(engine(crop))
