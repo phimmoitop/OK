@@ -84,6 +84,8 @@ jobs:
               "Rec.ocr_version": OCRVersion.PPOCRV6,
               "Rec.rec_img_shape": [3, 48, 2048],
               "Rec.rec_batch_num": 1,
+              "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+              "EngineConfig.onnxruntime.inter_op_num_threads": 1,
           })
           print("ALL IMPORTS OK")
           PY
@@ -400,13 +402,12 @@ jobs:
           STEP = 1.0 / FPS
           WIN = 60.0               # moi diem neo cach nhau 1 phut
           SAMPLES_PER_WIN = 5      # toi da 5 frame rai deu trong moi cua so
-          MIN_WIN_FRAMES = 1       # chap nhan sub ngan chi xuat hien tren 1 frame mau
+          MIN_WIN_FRAMES = 1       # giu lay neo thua de giai doan anchor nhanh
           EARLY_STOP_HITS = 1      # gap frame dau tien co chu thi chot neo cua cua so
           MAX_REUSE = 2            # chi dung trong worker det+rec du phong
           SAME_IOU = 0.85          # chi dung trong worker det+rec du phong
-          FAST_HALF_K = 0.8        # nua chieu cao dai FAST = th * K
           FAST_STRIP_MAX_RATIO = 0.22   # dai FAST cao hon ty le nay cua video -> tat FAST
-          FAST_MIN_SCORE = 0.60    # FAST: diem toi thieu de giu ket qua
+          FAST_MIN_SCORE = 0.50    # uu tien FAST, theo nguong cua pipeline cu
           BLUR_W_K = 0.70          # chieu rong vung blur sub = 70% chieu rong video
           BLUR_H_K = 1.1           # chieu cao vung blur = text_height * 1.1
           BLUR_RANGE_K = 0.5       # gom neo vao 1 doan blur khi cy dao dong <= K * th
@@ -440,6 +441,8 @@ jobs:
                   "Rec.ocr_version": OCRVersion.PPOCRV6,
                   "Rec.rec_img_shape": [3, 48, 2048],
                   "Rec.rec_batch_num": 1,
+                  "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+                  "EngineConfig.onnxruntime.inter_op_num_threads": 1,
               })
               return _ENGINE
           def has_text_edges(gray):
@@ -479,8 +482,8 @@ jobs:
               for box, text, score in result:
                   text = re.sub(r"\s+", "", text)
                   chars = cjk_count(text)
-                  min_score = .34 if chars <= 2 else .40
-                  if chars < 1 or float(score) < min_score:
+                  min_score = .40
+                  if chars < 2 or float(score) < min_score:
                       continue
                   xs = [float(p[0]) + x_off for p in box]
                   ys = [float(p[1]) + y_off for p in box]
@@ -514,11 +517,6 @@ jobs:
               if isinstance(r, (list, tuple)) and r:
                   return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
               return "", 0.0
-          def retry_view(img):
-              """Alternative contrast view for first/uncertain frames of a subtitle cue."""
-              gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-              clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-              return cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR)
           def grab_frame(t, width, height):
               """Lay 1 frame tai thoi diem t bang ffmpeg CLI (seek on dinh, khong dung cv2 seek)."""
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}",
@@ -661,22 +659,25 @@ jobs:
               return {"win": win, "cy": cy, "th": th, "x1": x1, "x2": x2, "frames": len(by), "by": by,
                       "t_first": float(min(times)), "t_last": float(max(times)),
                       "t_mid": float(np.median(times))}
-          def anchor_strip(cy_lo, cy_hi, th, y0, height):
-              half = th * FAST_HALF_K
-              ty0 = max(y0, int(cy_lo - half))
-              ty1 = min(height, int(math.ceil(cy_hi + half)))
+          def anchor_strip(cy, th, y0, height):
+              # Crop FAST quanh tam neo trung vi, nhu pipeline cu; khong keo rong theo vai neo lech.
+              half = th * 0.9
+              ty0 = max(y0, int(cy - half))
+              ty1 = min(height, int(math.ceil(cy + half)))
               return ty0, ty1
-          def fast_check(seg, width, height, x0, x1, y0, duration, st):
+          def fast_check(seg, width, height, x0, x1, y0, st):
               """Tu kiem tra FAST tren doan CHINH: so rec-only voi det+rec tren cung 1 dai khit.
               Lay mau ngau nhien ca frame KHONG co sub de do ti le rac."""
+              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
               engine = make_engine()
               ty0, ty1 = seg["ty0"], seg["ty1"]
               n = 40
               rng = random.Random(12345)
               pos, neg, junk = [], 0, 0
               junk_txt = []
+              span = max(0.0, seg["t_end"] - seg["t_start"])
               for i in range(n):
-                  t = duration * (i + rng.random()) / n
+                  t = seg["t_start"] + span * (i + rng.random()) / n
                   image = grab_frame(t, width, height)
                   if image is None:
                       continue
@@ -690,7 +691,7 @@ jobs:
                   ref = norm_text("".join(d["text"] for d in sorted(dets, key=lambda d: d["x1"])))
                   txt, sc = rec_only(engine, strip)
                   chars = cjk_count(txt)
-                  rec_ok = chars >= 1 and sc >= (0.60 if chars <= 2 else FAST_MIN_SCORE)
+                  rec_ok = chars >= 2 and sc >= FAST_MIN_SCORE
                   if len(ref) >= 1:
                       pos.append(SequenceMatcher(None, ref, norm_text(txt) if rec_ok else "").ratio())
                   else:
@@ -700,7 +701,7 @@ jobs:
                           junk_txt.append((round(t, 1), txt, round(sc, 2)))
               mean = float(np.mean(pos)) if pos else 0.0
               junk_rate = junk / float(max(1, len(pos) + neg))
-              ok = len(pos) >= 8 and mean >= 0.70 and junk_rate <= 0.15
+              ok = len(pos) >= 5 and mean >= 0.55 and junk_rate <= 0.20
               log(f"[FAST-CHECK] co sub: {len(pos)} mau, khop TB {mean:.2f} | khong sub: {neg} mau, rac {junk} "
                   f"({junk_rate * 100:.1f}% tong mau) -> {'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
               for jt in junk_txt[:6]:
@@ -936,7 +937,7 @@ jobs:
               log(f"[worker seg{seg}@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
               return dets
           def worker_fast(task):
-              """FAST rec-only; OCR tung frame, them mot view OCR khi dau cue/score thap."""
+              """FAST rec-only; dung mot lan nhan dang/frame nhu pipeline cu."""
               seg, start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
@@ -948,7 +949,7 @@ jobs:
                      "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
-              dets, audit, k, calls, retries = [], [], 0, 0, 0
+              dets, audit, k, calls = [], [], 0, 0
               t_w = time.time()
               while True:
                   buf = proc.stdout.read(size)
@@ -967,27 +968,21 @@ jobs:
                   text, score = rec_only(engine, frame)
                   calls += 1
                   alt_text, alt_score = "", 0.0
-                  # Chay view thu hai chi khi diem nhan dang thap.
-                  if score < .72:
-                      alt_text, alt_score = rec_only(engine, retry_view(frame))
-                      retries += 1
                   selected_text, selected_score = text, score
-                  if alt_text and (alt_score > score + .02 or not text):
-                      selected_text, selected_score = alt_text, alt_score
                   cur = None
                   chars = cjk_count(selected_text)
                   if not selected_text:
                       status = "empty_recognition"
-                  elif chars < 1:
-                      status = "no_chinese_character"
+                  elif chars < 2:
+                      status = "fewer_than_two_chinese_characters"
                   elif selected_score < FAST_MIN_SCORE:
                       status = "rejected_low_confidence"
                   else:
                       status = "accepted"
                   audit.append((seg, fn, text, f"{score:.3f}", alt_text, f"{alt_score:.3f}" if alt_text else "",
                                 selected_text, f"{selected_score:.3f}", status))
-                  # Giu moi ket qua co chu Hoa; diem thap se duoc danh dau de review, khong xoa khoi SRT.
-                  if chars >= 1:
+                  # Theo pipeline cu: bo ket qua duoi 2 chu Han hoac duoi nguong diem.
+                  if chars >= 2 and selected_score >= FAST_MIN_SCORE:
                       glyph_w = sum(th if "\u4e00" <= ch <= "\u9fff" else th * 0.55 for ch in selected_text)
                       box_w = min(float(x1 - x0), max(th, glyph_w * 1.05))
                       cx = (x0 + x1) / 2.0
@@ -998,7 +993,7 @@ jobs:
                       dets.append(cur)
               proc.stdout.close()
               proc.wait()
-              log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} retries={retries} in {time.time() - t_w:.0f}s")
+              log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
               return dets, audit
           def stamp(seconds):
               ms = max(0, round(seconds * 1000))
@@ -1063,7 +1058,7 @@ jobs:
                   raise SystemExit("Cannot read source video dimensions")
               step = STEP
               # Dai ngang rong de khong cat mat chu dau/cuoi cua dong phu de dai.
-              x0, x1 = round(width * .05), round(width * .95)
+              x0, x1 = round(width * .175), round(width * .825)
               y0 = round(height * .65)
               ctx = (width, height, x0, x1, y0)
               nw = max(1, min(4, os.cpu_count() or 2))
@@ -1150,7 +1145,7 @@ jobs:
               tolerance = max(14.0, height * .03)
               strips_ok = True
               for s in segs:
-                  s["ty0"], s["ty1"] = anchor_strip(s["cy_lo"], s["cy_hi"], s["height"], y0, height)
+                  s["ty0"], s["ty1"] = anchor_strip(s["center_y"], s["height"], y0, height)
                   half = max(s["height"] * 1.6, tolerance * 1.1)
                   s["sy0"] = max(y0, int(s["cy_lo"] - half))
                   s["sy1"] = min(height, int(math.ceil(s["cy_hi"] + half)))
@@ -1162,13 +1157,12 @@ jobs:
                   log(f"[SEGMENT {i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']:.0f} "
                       f"({s['cy_lo']:.0f}..{s['cy_hi']:.0f}) th={s['height']:.0f} | "
                       f"fast_strip y={s['ty0']}..{s['ty1']} ({s['ty1'] - s['ty0']}px)")
-              # ---------- 1d: tu kiem tra FAST (1 lan, tren doan chinh) ----------
-              # Chi dung FAST rec-only cho OCR toan video. Det+rec van duoc dung o buoc neo vi tri.
-              # Neu dai crop khong hop le thi dung workflow thay vi am tham chay cham bang det+rec.
+              # ---------- 1d: kiem tra FAST theo do khop voi det+rec ----------
               if not strips_ok:
                   raise RuntimeError("FAST OCR không thể chạy: dải phụ đề quá cao/thấp hoặc crop không hợp lệ.")
-              fast = True
-              log("[FAST-CHECK] Bật FAST rec-only; không fallback sang det+rec.")
+              fast = all(fast_check(s, width, height, x0, x1, y0, static_info) for s in segs)
+              log("[FAST-CHECK] Bật FAST rec-only." if fast else
+                  "[FAST-CHECK] Độ khớp thấp; dùng det+rec để giữ chất lượng.")
               log(f"[ANCHOR] giai doan 1 xong sau {time.time() - t_start:.0f}s")
               # ---------- GIAI DOAN 2: OCR toan video theo doan ----------
               total_frames = int(duration * FPS)
@@ -1247,23 +1241,9 @@ jobs:
               n_merged = len(cues)
               def cue_discard_reason(c):
                   text = norm_text(c["text"])
-                  mean = sum(c["scores"]) / max(1, len(c["scores"]))
-                  duration = c["last"] - c["first"] + step
-                  # Keep common meaningful one-character replies/kinship terms even when brief.
-                  keep_single = set("嗯啊哦唉哎诶是好不对没行去来走看听说我你他她它爸妈哥姐弟妹叔婶爷奶儿女一二三四五六七八九十")
-                  if (len(text) == 1 and cjk_count(text) == 1 and c["frames"] == 1
-                          and duration <= 0.45 and mean < 0.72 and text not in keep_single):
-                      return "single_char_short_low_confidence"
-                  # Obvious short OCR fragments made only from digits and 一 (e.g. 1一1 / 一一).
-                  if (len(text) >= 2 and re.fullmatch(r"[0-9一]+", text)
-                          and c["frames"] <= 2 and duration <= 0.75 and mean < 0.90):
-                      return "short_numeric_yi_fragment"
-                  # Very short, low-confidence mixtures of Latin/digits and Chinese are usually OCR noise.
-                  if (2 <= len(text) <= 5 and cjk_count(text) >= 1
-                          and re.search(r"[A-Za-z0-9]", text) and c["frames"] == 1
-                          and duration <= 0.45 and mean < 0.75):
-                      return "short_mixed_script_low_confidence"
-                  return "" if cjk_count(text) >= 1 else "no_chinese_character"
+                  if cjk_count(text) < 2:
+                      return "fewer_than_two_chinese_characters"
+                  return ""
               kept_cues, discarded_rows = [], []
               for c in cues:
                   reason = cue_discard_reason(c)
