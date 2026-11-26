@@ -436,13 +436,21 @@ jobs:
               print(msg, flush=True)
           class IgnoreEmptyDetectionWarning(logging.Filter):
               def filter(self, record):
+                  # Hide noisy RapidOCR INFO messages and repeated empty-detection warnings.
+                  if record.levelno == logging.INFO:
+                      return False
                   return "The text detection result is empty" not in record.getMessage()
+          def quiet_rapidocr_logs():
+              logger = logging.getLogger("RapidOCR")
+              if not any(isinstance(f, IgnoreEmptyDetectionWarning) for f in logger.filters):
+                  logger.addFilter(IgnoreEmptyDetectionWarning())
           _ENGINE = None
           def make_engine():
               """Cache 1 engine moi process (tranh load model lai o moi task)."""
               global _ENGINE
               if _ENGINE is not None:
                   return _ENGINE
+              quiet_rapidocr_logs()
               from rapidocr import EngineType, LangRec, ModelType, OCRVersion, RapidOCR
               # PP-OCRv6 small giu toc do; rong 2048 de khong ep dong sub dai vao 320px.
               _ENGINE = RapidOCR(params={
@@ -630,7 +638,7 @@ jobs:
               return n_win, wins
           def sample_worker(task):
               width, height, x0, x1, y0, wins = task
-              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
+              quiet_rapidocr_logs()
               engine = make_engine()
               dets = []
               for w, times in wins:
@@ -686,7 +694,7 @@ jobs:
           def fast_check(seg, width, height, x0, x1, y0, st):
               """Tu kiem tra FAST tren doan CHINH: so rec-only voi det+rec tren cung 1 dai khit.
               Lay mau ngau nhien ca frame KHONG co sub de do ti le rac."""
-              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
+              quiet_rapidocr_logs()
               engine = make_engine()
               ty0, ty1 = seg["ty0"], seg["ty1"]
               n = 40
@@ -908,7 +916,7 @@ jobs:
           def worker(task):
               seg, start_frame, n_frames, x0, y0, x1, y1 = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
-              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
+              quiet_rapidocr_logs()
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
                      "-ss", f"{start_frame * STEP:.3f}", "-i", VIDEO,
@@ -960,7 +968,7 @@ jobs:
               """FAST rec-only; dung mot lan nhan dang/frame nhu pipeline cu."""
               seg, start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
-              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
+              quiet_rapidocr_logs()
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
                      "-ss", f"{start_frame * STEP:.3f}", "-i", VIDEO,
