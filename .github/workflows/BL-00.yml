@@ -1081,6 +1081,8 @@ jobs:
                   (OUT / "hardsub-3fps.srt").write_text("", encoding="utf-8")
                   (OUT / "ocr-review-needed.tsv").write_text(
                       "start\tend\tmean_confidence\tframes\ttext\treason\n", encoding="utf-8")
+                  (OUT / "ocr-discarded.tsv").write_text(
+                      "start\tend\tmean_confidence\tframes\ttext\treason\n", encoding="utf-8")
                   write_gh_output(True)
               # ---------- GIAI DOAN 1a: mau thua theo cua so (song song) ----------
               n_win, wins = plan_samples(duration)
@@ -1127,8 +1129,10 @@ jobs:
               segs = []
               for g in groups:
                   cys = [a["cy"] for a in g]
-                  segs.append({"center_y": float(np.median(cys)), "cy_lo": float(min(cys)),
-                               "cy_hi": float(max(cys)),
+                  # Dung phan vi 10-90 de vai neo OCR lech khong lam dai FAST bao trum ca man hinh.
+                  segs.append({"center_y": float(np.median(cys)),
+                               "cy_lo": float(np.percentile(cys, 10)),
+                               "cy_hi": float(np.percentile(cys, 90)),
                                "x1": float(np.percentile([a["x1"] for a in g], 5)),
                                "x2": float(np.percentile([a["x2"] for a in g], 95)),
                                "height": float(np.median([a["th"] for a in g])),
@@ -1241,11 +1245,35 @@ jobs:
               n_before = len(cues)
               cues = merge_cues(cues)
               n_merged = len(cues)
-              def keep_cue(x):
-                  # Chinh sach uu tien do day: giu cue OCR co chu Trung, ke ca cue 1 frame/diem thap.
-                  return cjk_count(x["text"]) >= 1
-              cues = [x for x in cues if keep_cue(x)]
-              log(f"[CUE] {n_before} cue tho -> {n_merged} sau gop cue gan nhau -> {len(cues)} sau loc rac")
+              def cue_discard_reason(c):
+                  text = norm_text(c["text"])
+                  mean = sum(c["scores"]) / max(1, len(c["scores"]))
+                  duration = c["last"] - c["first"] + step
+                  # Keep common meaningful one-character replies/kinship terms even when brief.
+                  keep_single = set("嗯啊哦唉哎诶是好不对没行去来走看听说我你他她它爸妈哥姐弟妹叔婶爷奶儿女一二三四五六七八九十")
+                  if (len(text) == 1 and cjk_count(text) == 1 and c["frames"] == 1
+                          and duration <= 0.45 and mean < 0.72 and text not in keep_single):
+                      return "single_char_short_low_confidence"
+                  # Obvious short OCR fragments made only from digits and 一 (e.g. 1一1 / 一一).
+                  if (len(text) >= 2 and re.fullmatch(r"[0-9一]+", text)
+                          and c["frames"] <= 2 and duration <= 0.75 and mean < 0.90):
+                      return "short_numeric_yi_fragment"
+                  # Very short, low-confidence mixtures of Latin/digits and Chinese are usually OCR noise.
+                  if (2 <= len(text) <= 5 and cjk_count(text) >= 1
+                          and re.search(r"[A-Za-z0-9]", text) and c["frames"] == 1
+                          and duration <= 0.45 and mean < 0.75):
+                      return "short_mixed_script_low_confidence"
+                  return "" if cjk_count(text) >= 1 else "no_chinese_character"
+              kept_cues, discarded_rows = [], []
+              for c in cues:
+                  reason = cue_discard_reason(c)
+                  if reason:
+                      discarded_rows.append((c, sum(c["scores"]) / len(c["scores"]), reason))
+                  else:
+                      kept_cues.append(c)
+              cues = kept_cues
+              log(f"[CUE] {n_before} cue tho -> {n_merged} sau gop -> {len(cues)} giu, "
+                  f"{len(discarded_rows)} nghi rac bi loai (xem ocr-discarded.tsv)")
               srt = OUT / "hardsub-3fps.srt"
               with srt.open("w", encoding="utf-8") as f:
                   prev_end = 0.0
@@ -1270,6 +1298,11 @@ jobs:
               with (OUT / "ocr-review-needed.tsv").open("w", encoding="utf-8") as f:
                   f.write("start\tend\tmean_confidence\tframes\ttext\treason\n")
                   for seg, mean, reason in review_rows:
+                      f.write(f"{seg['first']:.3f}\t{seg['last']:.3f}\t{mean:.3f}\t"
+                              f"{seg['frames']}\t{seg['text']}\t{reason}\n")
+              with (OUT / "ocr-discarded.tsv").open("w", encoding="utf-8") as f:
+                  f.write("start\tend\tmean_confidence\tframes\ttext\treason\n")
+                  for seg, mean, reason in discarded_rows:
                       f.write(f"{seg['first']:.3f}\t{seg['last']:.3f}\t{mean:.3f}\t"
                               f"{seg['frames']}\t{seg['text']}\t{reason}\n")
               # ---------- Geometry (blur bam theo tung doan sub) ----------
@@ -1307,7 +1340,7 @@ jobs:
                       cv2.imwrite(str(WORK / "subtitle-geometry-preview.jpg"), image)
               except Exception as e:
                   log(f"[PREVIEW] bo qua: {e!r}")
-              needs_review = bool(review_rows) or not valid_geometry or not cues
+              needs_review = bool(review_rows or discarded_rows) or not valid_geometry or not cues
               write_gh_output(needs_review)
               print(f"duration={duration:.3f}s size={width}x{height} "
                     f"windows={n_win} anchors={len(real)} segments={len(segs)} blur_segments={len(blur_segs)} "
@@ -1587,6 +1620,7 @@ jobs:
           cp "${EP_DIR}/native-frames-3fps.txt" "$PACK/native-frames-3fps.txt"
           cp "${EP_DIR}/ocr/ocr-raw-3fps.tsv" "$PACK/ocr-raw-3fps.tsv"
           cp "${EP_DIR}/ocr/ocr-review-needed.tsv" "$PACK/ocr-review-needed.tsv"
+          cp "${EP_DIR}/ocr/ocr-discarded.tsv" "$PACK/ocr-discarded.tsv"
           cp "${EP_DIR}/subtitle_geometry.json" "$PACK/subtitle_geometry.json"
           cp "${EP_DIR}/static_regions.json" "$PACK/static_regions.json"
           printf '%s' "$PD_ID" > "$PACK/raw.txt"
