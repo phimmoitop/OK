@@ -51,8 +51,17 @@ jobs:
       - name: Install system packages
         run: |
           set -eux
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg zip unzip jq
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=60 update && \
+               sudo apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=60 install -y ffmpeg zip unzip jq; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo '::error::apt could not fetch system packages after 3 attempts'
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -408,6 +417,8 @@ jobs:
           SAME_IOU = 0.85          # chi dung trong worker det+rec du phong
           FAST_STRIP_MAX_RATIO = 0.22   # dai FAST cao hon ty le nay cua video -> tat FAST
           FAST_MIN_SCORE = 0.50    # uu tien FAST, theo nguong cua pipeline cu
+          FAST_MIN_POSITIVE_SAMPLES = 1  # uu tien toc do: chi can 1 mau co sub de xac nhan
+          FAST_MAX_JUNK_RATE = 0.80       # chap nhan rec-only doc nham toi da 80% mau khong sub
           BLUR_W_K = 0.70          # chieu rong vung blur sub = 70% chieu rong video
           BLUR_H_K = 1.1           # chieu cao vung blur = text_height * 1.1
           BLUR_RANGE_K = 0.5       # gom neo vao 1 doan blur khi cy dao dong <= K * th
@@ -708,7 +719,8 @@ jobs:
                           junk_txt.append((round(t, 1), txt, round(sc, 2)))
               mean = float(np.mean(pos)) if pos else 0.0
               junk_rate = junk / float(max(1, len(pos) + neg))
-              ok = len(pos) >= 5 and mean >= 0.55 and junk_rate <= 0.20
+              ok = (len(pos) >= FAST_MIN_POSITIVE_SAMPLES and mean >= 0.55
+                    and junk_rate <= FAST_MAX_JUNK_RATE)
               log(f"[FAST-CHECK] co sub: {len(pos)} mau, khop TB {mean:.2f} | khong sub: {neg} mau, rac {junk} "
                   f"({junk_rate * 100:.1f}% tong mau) -> {'DUNG che do nhanh' if ok else 'KHONG dung (dung det+rec)'}")
               for jt in junk_txt[:6]:
@@ -896,6 +908,7 @@ jobs:
           def worker(task):
               seg, start_frame, n_frames, x0, y0, x1, y1 = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
+              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
                      "-ss", f"{start_frame * STEP:.3f}", "-i", VIDEO,
@@ -947,6 +960,7 @@ jobs:
               """FAST rec-only; dung mot lan nhan dang/frame nhu pipeline cu."""
               seg, start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
+              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
                      "-ss", f"{start_frame * STEP:.3f}", "-i", VIDEO,
