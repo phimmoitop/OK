@@ -1053,6 +1053,11 @@ jobs:
                   return False
               if a == b:
                   return True
+              # OCR hay nham 1 ky tu trong cue rat ngan (vd: 各队撒 / 各队撤).
+              # Neu chi lech toi da 1 ky tu va cue dai <= 4 ky tu, cho phep gop.
+              if max(len(a), len(b)) <= 4:
+                  return (abs(len(a) - len(b)) <= 1
+                          and SequenceMatcher(None, a, b, autojunk=False).ratio() >= 0.65)
               return (abs(len(a) - len(b)) <= 1
                       and SequenceMatcher(None, a, b, autojunk=False).ratio() >= MERGE_SIM)
           def best_variant(variants):
