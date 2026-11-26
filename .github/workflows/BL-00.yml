@@ -388,7 +388,7 @@ jobs:
              Moi segment la 1 doan BLUR nho bam theo vi tri sub cuc bo (neo dao dong <= BLUR_RANGE_K*th).
           Bien moi truong: VIDEO (mac dinh raw_video.mp4), WORK_DIR (mac dinh work).
           """
-          import cv2, json, math, os, random, re, subprocess, sys, time
+          import cv2, json, logging, math, os, random, re, subprocess, sys, time
           import multiprocessing as mp
           import numpy as np
           from pathlib import Path
@@ -396,12 +396,12 @@ jobs:
           VIDEO = os.environ.get("VIDEO", "raw_video.mp4")
           WORK = Path(os.environ.get("WORK_DIR", "work"))
           OUT = WORK / "ocr"
-          FPS = 5.0
+          FPS = 3.0
           STEP = 1.0 / FPS
-          WIN = 45.0               # khoang cach giua 2 diem neo (giay)
-          SAMPLES_PER_WIN = 8      # tang mau tim vi tri sub; early-stop van giu thoi gian nhanh
+          WIN = 60.0               # moi diem neo cach nhau 1 phut
+          SAMPLES_PER_WIN = 5      # toi da 5 frame rai deu trong moi cua so
           MIN_WIN_FRAMES = 1       # chap nhan sub ngan chi xuat hien tren 1 frame mau
-          EARLY_STOP_HITS = 3      # du N frame co chu thi bo qua mau con lai cua cua so
+          EARLY_STOP_HITS = 1      # gap frame dau tien co chu thi chot neo cua cua so
           MAX_REUSE = 2            # chi dung trong worker det+rec du phong
           SAME_IOU = 0.85          # chi dung trong worker det+rec du phong
           FAST_HALF_K = 0.8        # nua chieu cao dai FAST = th * K
@@ -422,6 +422,9 @@ jobs:
           MERGE_SIM = 0.90         # khong gop hai cau rieng chi vi cung chu de
           def log(msg):
               print(msg, flush=True)
+          class IgnoreEmptyDetectionWarning(logging.Filter):
+              def filter(self, record):
+                  return "The text detection result is empty" not in record.getMessage()
           _ENGINE = None
           def make_engine():
               """Cache 1 engine moi process (tranh load model lai o moi task)."""
@@ -511,9 +514,6 @@ jobs:
               if isinstance(r, (list, tuple)) and r:
                   return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
               return "", 0.0
-          def text_similarity(a, b):
-              a, b = norm_text(a), norm_text(b)
-              return SequenceMatcher(None, a, b, autojunk=False).ratio() if a and b else 0.0
           def retry_view(img):
               """Alternative contrast view for first/uncertain frames of a subtitle cue."""
               gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -608,12 +608,13 @@ jobs:
                   ln = b - a
                   if ln <= 0.5:
                       continue
-                  n = max(3, min(spw, int(ln)))
+                  n = max(1, min(spw, int(ln)))
                   times = [min(a + (j + 0.5) * ln / n, max(0.0, duration - 0.2)) for j in range(n)]
                   wins.append((w, times))
               return n_win, wins
           def sample_worker(task):
               width, height, x0, x1, y0, wins = task
+              logging.getLogger("RapidOCR").addFilter(IgnoreEmptyDetectionWarning())
               engine = make_engine()
               dets = []
               for w, times in wins:
@@ -948,7 +949,6 @@ jobs:
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
               dets, audit, k, calls, retries = [], [], 0, 0, 0
-              last_text = ""
               t_w = time.time()
               while True:
                   buf = proc.stdout.read(size)
@@ -963,13 +963,12 @@ jobs:
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       audit.append((seg, fn, "", "", "", "", "", "", "no_text_edges"))
-                      last_text = ""
                       continue
                   text, score = rec_only(engine, frame)
                   calls += 1
                   alt_text, alt_score = "", 0.0
-                  # Chay view thu hai chi luc bat dau/doi cau hoac OCR co diem thap.
-                  if score < .72 or (text and (not last_text or text_similarity(text, last_text) < .90)):
+                  # Chay view thu hai chi khi diem nhan dang thap.
+                  if score < .72:
                       alt_text, alt_score = rec_only(engine, retry_view(frame))
                       retries += 1
                   selected_text, selected_score = text, score
@@ -997,7 +996,6 @@ jobs:
                              "x1": bx1, "x2": bx2,
                              "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy, "seg": seg}
                       dets.append(cur)
-                  last_text = selected_text
               proc.stdout.close()
               proc.wait()
               log(f"[fast seg{seg}@{start_frame}] done frames={k} rec_calls={calls} retries={retries} in {time.time() - t_w:.0f}s")
@@ -1080,7 +1078,7 @@ jobs:
                   log(f"[GEOMETRY] KHONG HOP LE: {reason}")
                   (WORK / "subtitle_geometry.json").write_text(
                       json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                  (OUT / "hardsub-5fps.srt").write_text("", encoding="utf-8")
+                  (OUT / "hardsub-3fps.srt").write_text("", encoding="utf-8")
                   (OUT / "ocr-review-needed.tsv").write_text(
                       "start\tend\tmean_confidence\tframes\ttext\treason\n", encoding="utf-8")
                   write_gh_output(True)
@@ -1194,7 +1192,7 @@ jobs:
               if fast:
                   detections = [d for part, _ in parts for d in part]
                   frame_audit = sorted((row for _, rows in parts for row in rows), key=lambda row: (row[1], row[0]))
-                  with (OUT / "ocr-frames-5fps.txt").open("w", encoding="utf-8") as f:
+                  with (OUT / "ocr-frames-3fps.txt").open("w", encoding="utf-8") as f:
                       f.write("segment\tframe\ttime\traw_text\traw_confidence\talt_text\talt_confidence\tselected_text\tselected_confidence\tstatus\n")
                       for si, fn, raw, raw_score, alt, alt_score, selected, selected_score, status in frame_audit:
                           f.write(f"{si}\t{fn}\t{fn * STEP:.3f}\t{raw}\t{raw_score}\t{alt}\t{alt_score}\t"
@@ -1203,7 +1201,7 @@ jobs:
                   detections = [d for p in parts for d in p]
               detections.sort(key=lambda d: (d["frame"], d["seg"], d["x1"]))
               log(f"[OCR] xong sau {time.time() - t_start:.0f}s, detections={len(detections)}")
-              with (OUT / "ocr-raw-5fps.tsv").open("w", encoding="utf-8") as f:
+              with (OUT / "ocr-raw-3fps.tsv").open("w", encoding="utf-8") as f:
                   f.write("time\tconfidence\ttext\tx1\ty1\tx2\ty2\tseg\n")
                   for d in detections:
                       f.write(f"{d['time']:.3f}\t{d['score']:.3f}\t{d['text']}\t"
@@ -1248,7 +1246,7 @@ jobs:
                   return cjk_count(x["text"]) >= 1
               cues = [x for x in cues if keep_cue(x)]
               log(f"[CUE] {n_before} cue tho -> {n_merged} sau gop cue gan nhau -> {len(cues)} sau loc rac")
-              srt = OUT / "hardsub-5fps.srt"
+              srt = OUT / "hardsub-3fps.srt"
               with srt.open("w", encoding="utf-8") as f:
                   prev_end = 0.0
                   idx = 0
@@ -1572,8 +1570,8 @@ jobs:
           export WORK_DIR="${EP_DIR}"
           mkdir -p "${EP_DIR}/ocr"
           python3 ocr_run.py
-          cp "${EP_DIR}/ocr/hardsub-5fps.srt" "${EP_DIR}/native.srt"
-          cp "${EP_DIR}/ocr/ocr-frames-5fps.txt" "${EP_DIR}/native-frames-5fps.txt"
+          cp "${EP_DIR}/ocr/hardsub-3fps.srt" "${EP_DIR}/native.srt"
+          cp "${EP_DIR}/ocr/ocr-frames-3fps.txt" "${EP_DIR}/native-frames-3fps.txt"
           python3 - <<'PYCODE'
           import json, os, sys
           d=os.environ['WORK_DIR']
@@ -1586,8 +1584,8 @@ jobs:
           PACK="${EP_DIR}/pack"
           mkdir -p "$PACK"
           cp "${EP_DIR}/native.srt" "$PACK/native.srt"
-          cp "${EP_DIR}/native-frames-5fps.txt" "$PACK/native-frames-5fps.txt"
-          cp "${EP_DIR}/ocr/ocr-raw-5fps.tsv" "$PACK/ocr-raw-5fps.tsv"
+          cp "${EP_DIR}/native-frames-3fps.txt" "$PACK/native-frames-3fps.txt"
+          cp "${EP_DIR}/ocr/ocr-raw-3fps.tsv" "$PACK/ocr-raw-3fps.tsv"
           cp "${EP_DIR}/ocr/ocr-review-needed.tsv" "$PACK/ocr-review-needed.tsv"
           cp "${EP_DIR}/subtitle_geometry.json" "$PACK/subtitle_geometry.json"
           cp "${EP_DIR}/static_regions.json" "$PACK/static_regions.json"
