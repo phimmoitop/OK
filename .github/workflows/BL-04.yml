@@ -149,7 +149,7 @@ jobs:
                 rm -f "$OUT"
               fi
               echo "[GET $OUT] attempt $attempt/10"
-              curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
+              curl -fL --retry 1 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
                 "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" \
                 || echo "::warning::curl lỗi lần $attempt, thử tiếp (resume)."
               sleep 3
