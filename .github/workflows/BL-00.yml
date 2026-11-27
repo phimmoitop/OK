@@ -393,7 +393,7 @@ jobs:
              -> dai (band) chua sub -> 1 diem neo (cy, th). th = TRUNG VI chieu cao TUNG BOX.
              Chu TINH (watermark/logo) duoc loai tren TOAN BO mau.
           2) Gom neo thanh DOAN vi tri (mac dinh 1 doan; chi tach khi >= 2 neo lien tiep cung lech y).
-          3) FAST (rec-only) chi bat khi dai khit 1 dong + do khop cao + ti le rac thap.
+          3) Mac dinh uu tien FAST (rec-only); OCR_FAST=0 de bat lai tu dong kiem tra chat luong cu.
           4) Gop cue: gop frame lien tiep, roi gop cue gan nhau co chu gan giong.
           5) Xuat <WORK_DIR>/subtitle_geometry.json dang { segments: [ {t_start,t_end,center_y,height,blur{}} ] }.
              Moi segment la 1 doan BLUR nho bam theo vi tri sub cuc bo (neo dao dong <= BLUR_RANGE_K*th).
@@ -1194,7 +1194,10 @@ jobs:
               # ---------- 1d: kiem tra FAST theo do khop voi det+rec ----------
               if not strips_ok:
                   raise RuntimeError("FAST OCR không thể chạy: dải phụ đề quá cao/thấp hoặc crop không hợp lệ.")
-              fast = all(fast_check(s, width, height, x0, x1, y0, static_info) for s in segs)
+              fast_checks_ok = all(fast_check(s, width, height, x0, x1, y0, static_info) for s in segs)
+              fast = os.environ.get("OCR_FAST", "1") == "1" or fast_checks_ok
+              if os.environ.get("OCR_FAST", "1") == "1" and not fast_checks_ok:
+                  log("[FAST-CHECK] OCR_FAST=1: van uu tien FAST rec-only theo cau hinh.")
               log("[FAST-CHECK] Bật FAST rec-only." if fast else
                   "[FAST-CHECK] Độ khớp thấp; dùng det+rec để giữ chất lượng.")
               log(f"[ANCHOR] giai doan 1 xong sau {time.time() - t_start:.0f}s")
@@ -1231,6 +1234,10 @@ jobs:
                                   f"{selected}\t{selected_score}\t{status}\n")
               else:
                   detections = [d for p in parts for d in p]
+                  # Downstream packaging consumes this file in both OCR modes.
+                  # det+rec has no rec-only frame audit, so publish a header-only file.
+                  with (OUT / "ocr-frames-3fps.txt").open("w", encoding="utf-8") as f:
+                      f.write("segment\tframe\ttime\traw_text\traw_confidence\talt_text\talt_confidence\tselected_text\tselected_confidence\tstatus\n")
               detections.sort(key=lambda d: (d["frame"], d["seg"], d["x1"]))
               log(f"[OCR] xong sau {time.time() - t_start:.0f}s, detections={len(detections)}")
               with (OUT / "ocr-raw-3fps.tsv").open("w", encoding="utf-8") as f:
