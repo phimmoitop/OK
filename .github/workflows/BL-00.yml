@@ -393,7 +393,7 @@ jobs:
              -> dai (band) chua sub -> 1 diem neo (cy, th). th = TRUNG VI chieu cao TUNG BOX.
              Chu TINH (watermark/logo) duoc loai tren TOAN BO mau.
           2) Gom neo thanh DOAN vi tri (mac dinh 1 doan; chi tach khi >= 2 neo lien tiep cung lech y).
-          3) Mac dinh uu tien FAST (rec-only); OCR_FAST=0 de bat lai tu dong kiem tra chat luong cu.
+          3) Mac dinh dung FAST (rec-only), khong doi chieu noi dung; anchor chi de do vi tri phu de.
           4) Gop cue: gop frame lien tiep, roi gop cue gan nhau co chu gan giong.
           5) Xuat <WORK_DIR>/subtitle_geometry.json dang { segments: [ {t_start,t_end,center_y,height,blur{}} ] }.
              Moi segment la 1 doan BLUR nho bam theo vi tri sub cuc bo (neo dao dong <= BLUR_RANGE_K*th).
@@ -424,7 +424,6 @@ jobs:
           BLUR_RANGE_K = 0.5       # gom neo vao 1 doan blur khi cy dao dong <= K * th
           BLUR_MIN_GROUP = 2       # doan blur it hon N neo thi gop vao doan ben canh
           BLUR_OUTLIER_K = 0.5     # neo lech trung vi cua doan > K*th => coi la neo lac, bo
-          TH_MAX_RATIO = 0.12      # chieu cao chu > ty le nay cua video -> bo neo (do hong)
           CHANGE_TOL_K = 0.8       # lech y > max(10, K*th) moi coi la doi vi tri
           CHANGE_MIN_ANCHORS = 2   # can >= N neo lien tiep cung lech moi tach doan
           REFINE_MIN_GAP = 1.5     # dung do nhi phan khi khoang < N giay
@@ -599,9 +598,9 @@ jobs:
               if len(keep) != len(dets):
                   log(f"[STATIC] loai {len(dets) - len(keep)}/{len(dets)} detection (watermark)")
               return keep
-          def pick_band(dets, height, min_frames=3):
+          def pick_band(dets, height, min_frames=3, tolerance=None):
               """Gom box theo vi tri doc, tra ve dai on dinh nhat + tolerance."""
-              tolerance = max(14.0, height * .03)
+              tolerance = tolerance if tolerance is not None else max(14.0, height * .03)
               bands = []
               for d in sorted(dets, key=lambda v: v["cy"]):
                   choices = [(abs(float(np.median([x["cy"] for x in band])) - d["cy"]), band)
@@ -674,11 +673,15 @@ jobs:
                   lefts.append(min(d["x1"] for d in items))
                   rights.append(max(d["x2"] for d in items))
               cy = float(np.median(cys))
-              th = float(np.median(hs))
+              raw_th = float(np.median(hs))
+              # Box det co the gom ca nhieu dong/nhan nham canh. Dung tam box de
+              # lay vi tri, nhung khong de box cao lam crop FAST va vung blur qua lon.
+              th = max(10.0, min(raw_th, height * 0.12))
               x1 = float(np.percentile(lefts, 5))
               x2 = float(np.percentile(rights, 95))
-              ok = (th >= max(8, height * .012) and th <= height * TH_MAX_RATIO
-                    and height * .35 <= cy <= height * .98)
+              # Chi can tam box nam trong vung OCR duoi man hinh de lay Y.
+              # Box cao bat thuong van co ich cho vi tri; chi gioi han th dung cho crop/blur.
+              ok = (raw_th > 0 and height * .65 <= cy <= height)
               if not ok:
                   return None
               times = [d["time"] for d in band]
@@ -1140,7 +1143,7 @@ jobs:
                       if anchors[w] is None:
                           rejected += 1
               real = [a for a in anchors if a]
-              log(f"[ANCHOR] {len(real)}/{n_win} cua so co neo sub ({rejected} neo bi bo vi chieu cao/vi tri bat thuong)")
+              log(f"[ANCHOR] {len(real)}/{n_win} moc thoi gian co vi tri Y ({rejected} box khong hop le)")
               if real:
                   ths = [a["th"] for a in real]
                   log(f"[ANCHOR] th (chieu cao 1 dong chu): trung vi={np.median(ths):.0f}px "
@@ -1191,15 +1194,16 @@ jobs:
                   log(f"[SEGMENT {i}] {s['t_start']:.1f}s -> {s['t_end']:.1f}s | cy={s['center_y']:.0f} "
                       f"({s['cy_lo']:.0f}..{s['cy_hi']:.0f}) th={s['height']:.0f} | "
                       f"fast_strip y={s['ty0']}..{s['ty1']} ({s['ty1'] - s['ty0']}px)")
-              # ---------- 1d: kiem tra FAST theo do khop voi det+rec ----------
+              # ---------- 1d: chon che do OCR ----------
               if not strips_ok:
                   raise RuntimeError("FAST OCR không thể chạy: dải phụ đề quá cao/thấp hoặc crop không hợp lệ.")
-              fast_checks_ok = all(fast_check(s, width, height, x0, x1, y0, static_info) for s in segs)
-              fast = os.environ.get("OCR_FAST", "1") == "1" or fast_checks_ok
-              if os.environ.get("OCR_FAST", "1") == "1" and not fast_checks_ok:
-                  log("[FAST-CHECK] OCR_FAST=1: van uu tien FAST rec-only theo cau hinh.")
-              log("[FAST-CHECK] Bật FAST rec-only." if fast else
-                  "[FAST-CHECK] Độ khớp thấp; dùng det+rec để giữ chất lượng.")
+              # OCR_FAST=1 (default): do vi tri bang anchor, sau do rec-only tren dai do.
+              # Khong so chu voi det+rec: text sai van huu ich neu nam trong dai subtitle.
+              fast = os.environ.get("OCR_FAST", "1") != "0"
+              if fast:
+                  log("[OCR] FAST rec-only; bo qua doi chieu text, anchor chi xac dinh vi tri.")
+              else:
+                  log("[OCR] OCR_FAST=0; dung det+rec theo cau hinh.")
               log(f"[ANCHOR] giai doan 1 xong sau {time.time() - t_start:.0f}s")
               # ---------- GIAI DOAN 2: OCR toan video theo doan ----------
               total_frames = int(duration * FPS)
@@ -1327,7 +1331,12 @@ jobs:
                       f.write(f"{seg['first']:.3f}\t{seg['last']:.3f}\t{mean:.3f}\t"
                               f"{seg['frames']}\t{seg['text']}\t{reason}\n")
               # ---------- Geometry (blur bam theo tung doan sub) ----------
-              valid_geometry = bool(segs) and len(real) >= max(1, int(math.ceil(0.25 * n_win)))
+              # FAST rec-only has no positioned boxes in phase 2. When its strip was
+              # validated against det+rec above, one credible anchor is enough to
+              # define a fixed blur band; requiring 25% of all windows rejects
+              # long videos when subtitles are sparse or anchor OCR is noisy.
+              min_geometry_anchors = 1 if fast else max(1, int(math.ceil(0.25 * n_win)))
+              valid_geometry = bool(segs) and len(real) >= min_geometry_anchors
               geometry["anchors"] = len(real)
               geometry["windows"] = n_win
               geometry["fast_ocr"] = bool(fast)
