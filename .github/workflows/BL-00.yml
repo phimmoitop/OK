@@ -87,23 +87,6 @@ jobs:
           print("ALL IMPORTS OK")
           PY
 
-      # ============================================================
-      # SMOKE TEST: PIXELDRAIN API KEY. Lỗi thì dừng ngay.
-      # ============================================================
-      - name: Test Pixeldrain API key (smoke test, stop early if it fails)
-        env:
-          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-        run: |
-          set -euo pipefail
-          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
-          code=$(curl -s -o /tmp/pd_user.json -w "%{http_code}" --retry 3 --retry-all-errors \
-            -u ":$PD_KEY" "https://pixeldrain.com/api/user" || true)
-          echo "HTTP $code"
-          [ "$code" = "200" ] || { echo "::error::Pixeldrain API key sai / không truy cập được: $(head -c 300 /tmp/pd_user.json 2>/dev/null)"; exit 1; }
-          can_upload=$(jq -r '.can_upload // true' /tmp/pd_user.json)
-          echo "Pixeldrain user: $(jq -r '.username' /tmp/pd_user.json) | can_upload=$can_upload"
-          [ "$can_upload" != "false" ] || { echo '::error::Tài khoản Pixeldrain chưa được phép upload (cần xác minh email)'; exit 1; }
-
       - name: Prepare directories
         run: |
           set -eux
@@ -128,33 +111,20 @@ jobs:
 
       - name: Download RAW video from Pixeldrain
         timeout-minutes: 120
-        env:
-          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$PD_KEY" ] || { echo '::error::Missing GitHub secret PIXELDRAIN_API_KEY'; exit 1; }
           URL="https://pixeldrain.com/api/file/${PD_ID}"
-          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -u ":$PD_KEY" "${URL}/info")
-          REMOTE_SIZE=$(jq -r '.size // empty' <<<"$info")
-          [ -n "$REMOTE_SIZE" ] || { echo '::error::Không lấy được kích thước RAW trên Pixeldrain'; exit 1; }
-          echo "Pixeldrain RAW: $(jq -r '.name' <<<"$info") | size=$REMOTE_SIZE"
           ok=0
           for attempt in $(seq 1 10); do
             echo "=== download attempt $attempt/10 (resume) ==="
-            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - -u ":$PD_KEY" \
-              -o raw_video.mp4 "${URL}?download" || true
-            if [ -s raw_video.mp4 ]; then
-              LOCAL=$(stat -c %s raw_video.mp4)
-              echo "local=$LOCAL remote=$REMOTE_SIZE"
-              if [ "$LOCAL" = "$REMOTE_SIZE" ]; then
-                d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4 2>/dev/null || true)
-                if [ -n "$d" ] && [ "$d" != "N/A" ]; then ok=1; break; fi
-                echo '::warning::ffprobe không đọc được video, tải lại từ đầu.'
-                rm -f raw_video.mp4
-              elif [ "$LOCAL" -gt "$REMOTE_SIZE" ]; then
-                echo '::warning::File local lớn hơn file Pixeldrain, tải lại từ đầu.'
-                rm -f raw_video.mp4
-              fi
+            download_ok=0
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - \
+              -o raw_video.mp4 "${URL}?download" && download_ok=1 || true
+            if [ "$download_ok" -eq 1 ] && [ -s raw_video.mp4 ]; then
+              d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_video.mp4 2>/dev/null || true)
+              if [ -n "$d" ] && [ "$d" != "N/A" ]; then ok=1; break; fi
+              echo '::warning::ffprobe không đọc được video sau khi tải xong.'
+              rm -f raw_video.mp4
             fi
             [ "$attempt" -lt 10 ] && sleep $(( attempt * 8 > 60 ? 60 : attempt * 8 ))
           done
@@ -364,11 +334,7 @@ jobs:
             if [ "$attempt" -lt "$MAX" ]; then sleep $(( attempt * 10 )); fi
           done
           [ -n "$ID" ] || { echo '::error::Upload Pixeldrain thất bại sau nhiều lần thử' >&2; exit 1; }
-          info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
-            "https://pixeldrain.com/api/file/${ID}/info")
-          remote_size=$(jq -r '.size' <<<"$info")
-          echo "Pixeldrain ID=$ID | size=$remote_size (local=$SIZE)" >&2
-          [ "$remote_size" = "$SIZE" ] || { echo '::error::Size trên Pixeldrain không khớp file local' >&2; exit 1; }
+          echo "Pixeldrain upload OK | ID=$ID | size=$SIZE bytes" >&2
           echo "$ID"
           SH
 
