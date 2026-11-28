@@ -102,7 +102,8 @@ jobs:
       # ============================================================
       # HÀM TẢI PIXELDRAIN DÙNG CHUNG
       #   - resume (-C -), kiểm tra sha256 nếu Pixeldrain có, không thì unzip -t / ffprobe
-      #   - SUB và RAW: thử tải 1 lần; nếu lỗi thì grab/copy bằng API key rồi thử ID mới đúng 1 lần
+      #   - Tải file ẩn danh; SUB và RAW: nếu lần tải đầu lỗi thì grab/copy bằng API key,
+      #     sau đó thử tải ID mới đúng 1 lần
       #   - AUDIO giữ cơ chế retry hiện tại
       # ============================================================
       - name: Create Pixeldrain download helper
@@ -147,9 +148,9 @@ jobs:
               if _ok; then ok=1; break; fi
               echo "[GET $OUT] attempt $attempt/$max_attempts id=$ID"
               if [ "$COPY_ON_FAILURE" = "yes" ]; then
-                curl -fL -C - "${AUTH[@]}" "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" || true
+                curl -fL -C - "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" || true
               else
-                curl -fL --retry 1 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
+                curl -fL --retry 1 --retry-delay 5 --retry-all-errors -C - \
                   "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" || true
               fi
               if _ok; then ok=1; break; fi
