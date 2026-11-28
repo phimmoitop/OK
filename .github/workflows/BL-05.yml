@@ -1,4 +1,4 @@
-name: "NEW [05] TM + VS → HLS"
+name: "NEW [03+04] TM AUDIO + VS SUB → HLS"
 
 on:
   workflow_dispatch:
@@ -667,9 +667,9 @@ jobs:
           for k, (x, y, w, h, fs) in enumerate(regions):
               fx = max(4, int(round(min(w, h) * .18)))
               feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png", sides=fs)
-          # Input: 0 = raw_video.mp4 (video + audio gốc),
-          #        1..L = work/blur_mask_k.png (lặp, mỗi level 1 mask),
-          #        (1+L).. = work/static_mask_k.png (lặp)
+          # Input: 0 = raw_video.mp4, 1 = mixed_audio.m4a,
+          #        2..(1+L) = work/blur_mask_k.png,
+          #        (2+L).. = work/static_mask_k.png
           L = len(levels)
           n_split = 1 + L + len(regions)
           graph = ["[0:v]split=%d[vbase]" % n_split
@@ -680,7 +680,7 @@ jobs:
               sg = max(10, min(60, int(round(h * .60))))
               graph.append(
                   f"[sp{k}]crop={w}:{h}:{x}:{y},gblur=sigma={sg},format=rgb24[sb{k}];"
-                  f"[{1 + L + k}:v]format=gray[sm{k}];"
+                  f"[{2 + L + k}:v]format=gray[sm{k}];"
                   f"[sb{k}][sm{k}]alphamerge[sq{k}];"
                   f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
               )
@@ -691,7 +691,7 @@ jobs:
                   f"[lv{k}]crop={lv['w']}:{lv['h']}:{lv['x']}:{lv['y']},"
                   f"scale=iw/4:ih/4,gblur=sigma={max(6, sigma // 4)},"
                   f"scale={lv['w']}:{lv['h']}:flags=bilinear,format=rgb24[lb{k}];"
-                  f"[{1 + k}:v]format=gray[lm{k}];"
+                  f"[{2 + k}:v]format=gray[lm{k}];"
                   f"[lb{k}][lm{k}]alphamerge[lq{k}];"
                   f"[{cur}][lq{k}]overlay=x={lv['x']}:y={lv['y']}:shortest=1{enable_expr(lv['iv'])}[lo{k}];"
               )
@@ -727,7 +727,7 @@ jobs:
               print(f"  [{k}] x={x} y={y} w={w} h={h} feather(l,r,t,b)={fs}")
           PY
           DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
-          # Thứ tự input mask phải khớp filter graph: blur_mask_0..L-1 trước, rồi static_mask_0..
+          # Thứ tự input mask: sau raw_video và mixed_audio, blur_mask_0..L-1 rồi static_mask_0..
           EXTRA=()
           for m in $(ls work/blur_mask_*.png 2>/dev/null | sort -V) $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
             EXTRA+=(-loop 1 -framerate 30 -t "$DUR" -i "$m")
