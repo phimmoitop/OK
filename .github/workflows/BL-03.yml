@@ -102,18 +102,29 @@ jobs:
       # ============================================================
       # HÀM TẢI PIXELDRAIN DÙNG CHUNG
       #   - resume (-C -), kiểm tra sha256 nếu Pixeldrain có, không thì unzip -t / ffprobe
-      #   - nếu có secret PIXELDRAIN_API_KEY thì dùng (đỡ bị giới hạn tải), không có thì tải ẩn danh
+      #   - SUB và RAW: thử tải 1 lần; nếu lỗi thì grab/copy bằng API key rồi thử ID mới đúng 1 lần
+      #   - AUDIO giữ cơ chế retry hiện tại
       # ============================================================
       - name: Create Pixeldrain download helper
         run: |
           cat > pd_get.sh <<'SH'
-          # usage: pd_get <pixeldrain_id> <out_file> <zip|video>
+          # usage: pd_get <pixeldrain_id> <out_file> <zip|video> [copy-on-failure]
           pd_get() {
-            local ID="$1" OUT="$2" KIND="$3"
+            local ID="$1" OUT="$2" KIND="$3" COPY_ON_FAILURE="${4:-no}"
             local AUTH=()
             [ -n "${PD_KEY:-}" ] && AUTH=(-u ":$PD_KEY")
-            local info want size avail
-            info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "${AUTH[@]}" "https://pixeldrain.com/api/file/${ID}/info" || true)
+            local info want size avail max_attempts attempt
+            if [ "$COPY_ON_FAILURE" = "yes" ]; then
+              max_attempts=2
+              [ -n "${PD_KEY:-}" ] || { echo '::error::PIXELDRAIN_API_KEY cần có để copy file khi tải SUB/RAW lỗi'; return 1; }
+            else
+              max_attempts=10
+            fi
+            if [ "$COPY_ON_FAILURE" = "yes" ]; then
+              info=$(curl -fsS "${AUTH[@]}" "https://pixeldrain.com/api/file/${ID}/info" || true)
+            else
+              info=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "${AUTH[@]}" "https://pixeldrain.com/api/file/${ID}/info" || true)
+            fi
             [ -n "$info" ] || { echo "::error::Không lấy được thông tin file '$ID' (sai ID / file đã bị xóa?)"; return 1; }
             want=$(jq -r '.hash_sha256 // empty' <<<"$info" 2>/dev/null || true)
             size=$(jq -r '.size // 0' <<<"$info" 2>/dev/null || echo 0)
@@ -131,21 +142,36 @@ jobs:
                 [ -n "$d" ] && [ "$d" != "N/A" ]
               fi
             }
-            local ok=0 attempt
-            for attempt in $(seq 1 10); do
+            local ok=0
+            for attempt in $(seq 1 "$max_attempts"); do
               if _ok; then ok=1; break; fi
-              if [ -f "$OUT" ] && [ "$size" -gt 0 ] && [ "$(stat -c %s "$OUT")" -ge "$size" ]; then
-                echo "::warning::$OUT đủ dung lượng nhưng sai, tải lại từ đầu."
-                rm -f "$OUT"
+              echo "[GET $OUT] attempt $attempt/$max_attempts id=$ID"
+              if [ "$COPY_ON_FAILURE" = "yes" ]; then
+                curl -fL -C - "${AUTH[@]}" "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" || true
+              else
+                curl -fL --retry 1 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
+                  "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" || true
               fi
-              echo "[GET $OUT] attempt $attempt/10"
-              curl -fL --retry 1 --retry-delay 5 --retry-all-errors -C - "${AUTH[@]}" \
-                "https://pixeldrain.com/api/file/${ID}?download" -o "$OUT" \
-                || echo "::warning::curl lỗi lần $attempt, thử tiếp (resume)."
-              sleep 3
+              if _ok; then ok=1; break; fi
+              echo "::warning::Tải/kiểm tra file '$ID' thất bại ở lần $attempt."
+              rm -f "$OUT"
+              if [ "$COPY_ON_FAILURE" = "yes" ] && [ "$attempt" -eq 1 ]; then
+                local copied new_id
+                echo "[COPY] Pixeldrain grab_file=$ID"
+                copied=$(curl -fsS -u ":$PD_KEY" -F "grab_file=$ID" "https://pixeldrain.com/api/file" || true)
+                new_id=$(jq -r '.id // empty' <<<"$copied" 2>/dev/null || true)
+                [ -n "$new_id" ] || { echo "::error::Không copy được file '$ID' qua Pixeldrain API: ${copied:-không có phản hồi}"; return 1; }
+                ID="$new_id"
+                info=$(curl -fsS -u ":$PD_KEY" "https://pixeldrain.com/api/file/${ID}/info" || true)
+                [ -n "$info" ] || { echo "::error::Copy xong ID mới '$ID' nhưng không lấy được info"; return 1; }
+                want=$(jq -r '.hash_sha256 // empty' <<<"$info" 2>/dev/null || true)
+                size=$(jq -r '.size // 0' <<<"$info" 2>/dev/null || echo 0)
+                avail=$(jq -r '.availability // empty' <<<"$info" 2>/dev/null || true)
+                echo "[COPY] Dùng ID mới: $ID"
+              fi
             done
             if [ "$ok" -ne 1 ] && _ok; then ok=1; fi
-            [ "$ok" -eq 1 ] || { echo "::error::Không tải được file '$ID' hợp lệ sau 10 lần thử."; return 1; }
+            [ "$ok" -eq 1 ] || { echo "::error::Không tải được file '$ID' hợp lệ sau $max_attempts lần thử."; return 1; }
             echo "[OK] $OUT hợp lệ"
           }
           SH
@@ -161,7 +187,7 @@ jobs:
           set -euo pipefail
           source pd_get.sh
 
-          pd_get "$SUB_ID" sub.zip zip
+          pd_get "$SUB_ID" sub.zip zip yes
           unzip -o -q sub.zip -d dl_sub
           for f in vietnamese.srt vietnamese.vtt; do
             [ -s "dl_sub/$f" ] || { echo "::error::Trong SUB zip thiếu file '$f' (SUB ID bước 1 không đúng?)"; exit 1; }
@@ -185,7 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           source pd_get.sh
-          pd_get "$RAW_ID" raw_video.mp4 video
+          pd_get "$RAW_ID" raw_video.mp4 video yes
           ls -lh raw_video.mp4
 
       - name: Validate downloaded media (video / vtt / audio khớp nhau)
