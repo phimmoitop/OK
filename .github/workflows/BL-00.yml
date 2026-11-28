@@ -357,12 +357,12 @@ jobs:
           VIDEO = os.environ.get("VIDEO", "raw_video.mp4")
           WORK = Path(os.environ.get("WORK_DIR", "work"))
           OUT = WORK / "ocr"
-          FPS = 3.0
+          FPS = 5.0
           STEP = 1.0 / FPS
           SPARSE_SAMPLES = 150
           MAX_REUSE = 2        # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
           SAME_IOU = 0.85      # nguong giong nhau cua mat na chu sang
-          FAST_HALF_K = 1.25   # nửa chiều cao dải OCR fast = text_height * K (cũ 0.9 → ~100px, 1.35 → ~150px)
+          FAST_HALF_K = 1.5    # nới dải OCR fast vừa phải; vẫn giữ crop đủ thấp để chữ không bị thu nhỏ
           BLUR_H_K = 1.1       # giữ tỷ lệ chiều cao blur của step0 hiện tại
           MAX_BLUR_H_RATIO = 0.18  # giới hạn chiều cao blur ở 18% khung hình
           def log(msg):
@@ -484,6 +484,15 @@ jobs:
               if not r:
                   return "", 0.0
               return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
+          def enhance_subtitle(img):
+              """Giam nen thay doi cham, tang tuong phan net chu va giu vien den cua hardsub."""
+              gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+              # Tru nen lam mo de nen ve xam trung tinh, con lai chu va vien chu ro hon.
+              bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=11, sigmaY=11)
+              detail = cv2.addWeighted(gray, 1.7, bg, -0.7, 0)
+              clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+              detail = clahe.apply(detail)
+              return cv2.cvtColor(detail, cv2.COLOR_GRAY2BGR)
           def find_strip(duration, width, height, x0, x1, y0):
               """Lay strip OCR va vi tri Y tu band box on dinh tren mau thua."""
               engine = make_engine()
@@ -597,8 +606,17 @@ jobs:
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       continue
-                  text, score = rec_only(engine, frame)
+                  # Anh da giam nen/tang tuong phan la luot chinh. Neu OCR yeu,
+                  # thu lai anh goc de tranh preprocessing lam mat net chu.
+                  text, score = rec_only(engine, enhance_subtitle(frame))
                   calls += 1
+                  cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+                  if score < .72 or cjk < 2:
+                      raw_text, raw_score = rec_only(engine, frame)
+                      calls += 1
+                      raw_cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in raw_text)
+                      if raw_score > score or raw_cjk > cjk:
+                          text, score = raw_text, raw_score
                   cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
                   if cjk < 2 or score < .50:
                       continue
